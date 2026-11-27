@@ -60,6 +60,7 @@ class VideoVisualLockTests(unittest.TestCase):
             no_baked_captions=True,
             no_hallucinated_tags=True,
             person_consistent=True,
+            reviewer="vlm:test",
         )
         self.assertEqual(validate_visual_lock_data(data, self.film, self.shots), [])
 
@@ -67,6 +68,20 @@ class VideoVisualLockTests(unittest.TestCase):
         (self.film / "shots" / "S01.mp4").write_bytes(b"video-v2-rerendered")
         errs = validate_visual_lock_data(data, self.film, self.shots)
         self.assertTrue(any("shot_sha256 mismatch" in e for e in errs), errs)
+
+    def test_manual_video_review_blocked_by_vlm_requirement(self) -> None:
+        data = build_visual_lock()
+        data = apply_video_review(
+            self.film,
+            data,
+            "S01",
+            size_stable=True,
+            size_vs_spec="match",
+            reviewer="manual",
+        )
+        errs = validate_visual_lock_data(data, self.film, self.shots)
+        self.assertTrue(any("reviewer must start with 'vlm:'" in e for e in errs), errs)
+        self.assertEqual(validate_visual_lock_data(data, self.film, self.shots, require_vlm_reviewer=False), [])
 
     def test_visual_review_blocks_pass_on_bad_flag(self) -> None:
         data = build_visual_lock()
@@ -175,7 +190,7 @@ class AssembleToolsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             film = Path(tmp)
             (film / "qa").mkdir()
-            (film / "qa" / "cues.json").write_text("[]")
+            (film / "qa" / "cues.json").write_text(json.dumps([{"start": 0.1, "end": 1.0, "text": "好包"}]))
             # Tiny 34px + linear align should fail
             (film / "qa" / "assemble-check.json").write_text(
                 json.dumps(
@@ -191,6 +206,19 @@ class AssembleToolsTests(unittest.TestCase):
             )
             errs = validate_assemble_data(film)
             self.assertEqual(len(errs), 3, errs)
+
+            # Sneaky has_captions=false without explicit_silent fails
+            (film / "qa" / "assemble-check.json").write_text(
+                json.dumps(
+                    {
+                        "bgm_source": "source",
+                        "has_captions": False,
+                        "leading_glitch_trimmed": True,
+                    }
+                )
+            )
+            errs_sneaky = validate_assemble_data(film)
+            self.assertTrue(any("explicit_silent" in e for e in errs_sneaky), errs_sneaky)
 
             # Valid config passes
             (film / "qa" / "assemble-check.json").write_text(

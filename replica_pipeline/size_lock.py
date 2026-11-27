@@ -45,7 +45,7 @@ def default_phrase_from_physical(cm: dict | None) -> str:
         return ""
     w, h, d = cm.get("w"), cm.get("h"), cm.get("d")
     if w and h and d:
-        return f"迷你约{w}×{h}×{d}cm；上身包宽约胸宽1/3–2/5"
+        return f"实测尺寸约{w}×{h}×{d}cm（按尺标图与佩戴比例参考图锁比例）"
     return ""
 
 
@@ -173,7 +173,22 @@ def validate_shot_size_evidence(
         return errs
 
     if source != SOURCE_USER:
-        # first_frame: string PASS still OK (canon still is the scale)
+        # Even in first_frame mode, ban bare "PASS" strings and require still_sha256 binding.
+        if not isinstance(entry, dict):
+            errs.append(
+                f"SIZE-LOCK.json: {sid} must be a structured object under first_frame "
+                "(bare PASS forbidden; run size-review)"
+            )
+            return errs
+        recorded_hash = entry.get("still_sha256")
+        if not recorded_hash:
+            errs.append(f"SIZE-LOCK.json: {sid} missing still_sha256")
+        elif film is not None:
+            still = film / "first-frames" / "h3" / f"{sid}-first.jpg"
+            if still.is_file() and _file_sha256(still) != recorded_hash:
+                errs.append(
+                    f"SIZE-LOCK.json: {sid} still_sha256 mismatch — still changed since size-review"
+                )
         return errs
 
     if not isinstance(entry, dict):

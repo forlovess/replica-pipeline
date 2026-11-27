@@ -98,15 +98,53 @@ class SizeLockUserSpecTests(unittest.TestCase):
         errs = validate_size_lock_data(data, self.film, self.shots)
         self.assertEqual(errs, [], errs)
 
-    def test_first_frame_still_allows_string_pass(self) -> None:
-        data = build_size_lock(
+    def test_first_frame_bans_bare_pass_and_checks_still_sha(self) -> None:
+        bare = build_size_lock(
             source="first_frame",
             canon_still="first-frames/h3/S01-first.jpg",
             shots={"S01": "PASS", "S02": "PASS"},
             phrase="match S01",
         )
-        errs = validate_size_lock_data(data, self.film, self.shots)
-        self.assertEqual(errs, [], errs)
+        errs_bare = validate_size_lock_data(bare, self.film, self.shots)
+        self.assertTrue(any("bare PASS forbidden" in e for e in errs_bare), errs_bare)
+
+        structured = build_size_lock(
+            source="first_frame",
+            canon_still="first-frames/h3/S01-first.jpg",
+            shots={},
+            phrase="match S01",
+        )
+        (self.film / "first-frames" / "h3" / "S02-first.jpg").write_bytes(b"y")
+        structured = apply_size_review(
+            structured,
+            "S01",
+            mode="worn",
+            vs_source_occupancy="n/a",
+            film=self.film,
+        )
+        structured = apply_size_review(
+            structured,
+            "S02",
+            mode="worn",
+            vs_source_occupancy="n/a",
+            film=self.film,
+        )
+        self.assertEqual(validate_size_lock_data(structured, self.film, self.shots), [])
+
+        # Redrawing S02-first.jpg invalidates first_frame size lock too
+        (self.film / "first-frames" / "h3" / "S02-first.jpg").write_bytes(b"y-redraw")
+        errs_sha = validate_size_lock_data(structured, self.film, self.shots)
+        self.assertTrue(any("still_sha256 mismatch" in e and "S02" in e for e in errs_sha), errs_sha)
+
+    def test_default_phrase_avoids_product_specific_chest_ratio(self) -> None:
+        data = build_size_lock(
+            source="user_spec",
+            canon_still="first-frames/h3/S01-first.jpg",
+            shots={},
+            physical_cm={"w": 15, "h": 18, "d": 7},
+        )
+        self.assertNotIn("1/3", data.get("phrase", ""))
+        self.assertIn("15×18×7cm", data.get("phrase", ""))
 
 
 if __name__ == "__main__":

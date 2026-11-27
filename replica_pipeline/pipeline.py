@@ -459,15 +459,30 @@ def cmd_require(args: argparse.Namespace) -> int:
     if action == "h3_submit" and not data["locks"].get("h3_submit"):
         print("GATE FAIL: locks.h3_submit=false", file=sys.stderr)
         return 2
-    if action == "assemble" and not data["locks"].get("assemble"):
-        print("GATE FAIL: locks.assemble=false", file=sys.stderr)
-        return 2
+    if action == "assemble":
+        if not data["locks"].get("assemble"):
+            print("GATE FAIL: locks.assemble=false", file=sys.stderr)
+            return 2
+        ok_h3, bad_h3 = artifacts_present(film, "5_h3")
+        if not ok_h3:
+            print(
+                "GATE FAIL: 5_h3 artifacts/locks invalid:\n  - " + "\n  - ".join(bad_h3),
+                file=sys.stderr,
+            )
+            return 2
     if action == "superres":
         if not data["locks"].get("superres_user_allow"):
             print("GATE FAIL: superres not user-allowed", file=sys.stderr)
             return 2
         if data["stages"]["6_assemble"]["status"] != "pass":
             print("GATE FAIL: assemble not pass", file=sys.stderr)
+            return 2
+        ok_asm, bad_asm = artifacts_present(film, "6_assemble")
+        if not ok_asm:
+            print(
+                "GATE FAIL: 6_assemble artifacts/locks invalid:\n  - " + "\n  - ".join(bad_asm),
+                file=sys.stderr,
+            )
             return 2
 
     # Per-shot still for h3_submit
@@ -543,14 +558,42 @@ def cmd_require(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 2
-        # S02+ require S01 voice bank
+        # S02+ require S01 voice bank matching current S01 video
         if shot != first_id:
             vwav = film / "qa/voice-lock/S01-voice.wav"
+            vjson = film / "qa/VOICE-LOCK.json"
             if not vwav.is_file():
                 print(
                     f"GATE FAIL: missing {vwav} — run extract-voice after {first_id} downloads",
                     file=sys.stderr,
                 )
+                return 2
+            if not vjson.is_file():
+                print(
+                    f"GATE FAIL: missing {vjson} — run extract-voice after {first_id} downloads",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                vmeta = json.loads(vjson.read_text())
+                s01_vid = film / "shots" / f"{first_id}.mp4"
+                src_sha = vmeta.get("source_sha256")
+                if not src_sha:
+                    print("GATE FAIL: VOICE-LOCK.json missing source_sha256", file=sys.stderr)
+                    return 2
+                if s01_vid.is_file():
+                    try:
+                        from .video_qa import file_sha256
+                    except ImportError:
+                        from video_qa import file_sha256
+                    if file_sha256(s01_vid) != src_sha:
+                        print(
+                            f"GATE FAIL: VOICE-LOCK stale ({first_id}.mp4 changed) — run extract-voice --force",
+                            file=sys.stderr,
+                        )
+                        return 2
+            except Exception as e:
+                print(f"GATE FAIL: invalid VOICE-LOCK.json: {e}", file=sys.stderr)
                 return 2
 
     print(json.dumps({"ok": True, "action": action, "film": film.name}, ensure_ascii=False))
@@ -924,6 +967,166 @@ def cmd_audit_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_source_prepare(args: argparse.Namespace) -> int:
+    """Prepare stage-1 source artifacts (probe, cuts.json, overview grid, optional ASR)."""
+    try:
+        from .hypit_bridge import prepare_source
+    except ImportError:
+        from hypit_bridge import prepare_source
+
+    res = prepare_source(
+        Path(args.film),
+        Path(args.source),
+        language=args.language,
+        threshold=float(args.threshold),
+        use_hypit=bool(args.use_hypit),
+        transcribe=bool(args.transcribe),
+    )
+    print(json.dumps({"ok": True, **res}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_lint_prompts(args: argparse.Namespace) -> int:
+    """Lint H3 prompts for spoken duration fit, complete clauses, tags, and brief claims."""
+    try:
+        from .script_lint import lint_film_prompts
+    except ImportError:
+        from script_lint import lint_film_prompts
+
+    res = lint_film_prompts(Path(args.film), shot_id=args.shot, pace=args.pace)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0 if res["ok"] else 2
+
+
+def cmd_estimate_speech(args: argparse.Namespace) -> int:
+    """Estimate spoken seconds for Chinese/mixed copy before locking shot duration."""
+    try:
+        from .script_lint import estimate_with_hypit, estimate_zh_speech
+    except ImportError:
+        from script_lint import estimate_with_hypit, estimate_zh_speech
+
+    text = Path(args.file).read_text() if args.file else (args.text or "")
+    if not text.strip():
+        print("Provide --text or --file", file=sys.stderr)
+        return 3
+    if args.use_hypit:
+        res = estimate_with_hypit(text, language=args.language, pace=args.pace)
+    else:
+        res = estimate_zh_speech(text, pace=args.pace, padding=float(args.padding))
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_candidate_list(args: argparse.Namespace) -> int:
+    """List archived H3 attempt candidates for a film or one shot."""
+    try:
+        from .candidates import list_candidates
+    except ImportError:
+        from candidates import list_candidates
+
+    print(json.dumps(list_candidates(Path(args.film), shot=args.shot), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_candidate_archive(args: argparse.Namespace) -> int:
+    """Archive current shot video/task into shots/candidates/ before rerolling."""
+    try:
+        from .candidates import archive_current_shot
+    except ImportError:
+        from candidates import archive_current_shot
+
+    entry = archive_current_shot(
+        Path(args.film),
+        args.shot,
+        note=args.note or "",
+        clear_active=bool(args.clear),
+    )
+    if entry is None:
+        print(f"Nothing to archive for {args.shot}", file=sys.stderr)
+        return 2
+    print(json.dumps({"ok": True, "candidate": entry}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_candidate_select(args: argparse.Namespace) -> int:
+    """Restore a preserved H3 candidate into active shots/ and contact sheets."""
+    try:
+        from .candidates import select_candidate
+    except ImportError:
+        from candidates import select_candidate
+
+    try:
+        res = select_candidate(Path(args.film), args.shot, args.candidate)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_assemble(args: argparse.Namespace) -> int:
+    """Assemble trimmed shots with ducked BGM and ASR-aligned Douyin captions."""
+    try:
+        from .assemble_tools import assemble_film
+    except ImportError:
+        from assemble_tools import assemble_film
+
+    try:
+        res = assemble_film(
+            Path(args.film),
+            bgm_path=Path(args.bgm) if args.bgm else None,
+            bgm_source=args.bgm_source,
+            bgm_db=float(args.bgm_db),
+            asr_dir=Path(args.asr_dir) if args.asr_dir else None,
+            width=int(args.width),
+            height=int(args.height),
+            skip_gate=bool(args.skip_gate),
+            allow_uncaptioned=bool(args.allow_uncaptioned),
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_review_html(args: argparse.Namespace) -> int:
+    """Generate a Hypit Studio-inspired interactive HTML review & feedback page."""
+    try:
+        from .review_gallery import write_review_html
+    except ImportError:
+        from review_gallery import write_review_html
+
+    film = Path(args.film) if args.film else None
+    batch = Path(args.batch) if args.batch else (None if film else Path.cwd())
+    out = Path(args.out) if args.out else None
+    p = write_review_html(film=film, batch=batch, out=out)
+    print(json.dumps({"ok": True, "review_html": str(p)}, ensure_ascii=False))
+    return 0
+
+
+def cmd_export_hypit(args: argparse.Namespace) -> int:
+    """Export film shots, script, timeline, and BGM as an editable Hypit SVML/SVRun project."""
+    try:
+        from .hypit_bridge import export_hypit_project
+    except ImportError:
+        from hypit_bridge import export_hypit_project
+
+    try:
+        res = export_hypit_project(
+            Path(args.film),
+            out_dir=Path(args.out) if args.out else None,
+            width=int(args.width),
+            height=int(args.height),
+            fps=int(args.fps),
+        )
+    except (FileNotFoundError, ValueError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Replica fail-closed pipeline")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1062,6 +1265,74 @@ def main() -> int:
     p = sub.add_parser("audit-batch")
     p.add_argument("--batch")
     p.set_defaults(func=cmd_audit_batch)
+
+    p = sub.add_parser("source-prepare")
+    p.add_argument("film")
+    p.add_argument("--source", required=True)
+    p.add_argument("--language", default="zh")
+    p.add_argument("--threshold", default="0.35")
+    p.add_argument("--use-hypit", action="store_true")
+    p.add_argument("--transcribe", action="store_true")
+    p.set_defaults(func=cmd_source_prepare)
+
+    p = sub.add_parser("lint-prompts")
+    p.add_argument("film")
+    p.add_argument("--shot", default=None)
+    p.add_argument("--pace", default="normal", choices=["slow", "normal", "fast"])
+    p.set_defaults(func=cmd_lint_prompts)
+
+    p = sub.add_parser("estimate-speech")
+    p.add_argument("--text", default="")
+    p.add_argument("--file", default=None)
+    p.add_argument("--language", default="zh")
+    p.add_argument("--pace", default="normal", choices=["slow", "normal", "fast"])
+    p.add_argument("--padding", default="0")
+    p.add_argument("--use-hypit", action="store_true")
+    p.set_defaults(func=cmd_estimate_speech)
+
+    p = sub.add_parser("candidate-list")
+    p.add_argument("film")
+    p.add_argument("--shot", default=None)
+    p.set_defaults(func=cmd_candidate_list)
+
+    p = sub.add_parser("candidate-archive")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True)
+    p.add_argument("--note", default="")
+    p.add_argument("--clear", action="store_true")
+    p.set_defaults(func=cmd_candidate_archive)
+
+    p = sub.add_parser("candidate-select")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True)
+    p.add_argument("--candidate", required=True)
+    p.set_defaults(func=cmd_candidate_select)
+
+    p = sub.add_parser("assemble")
+    p.add_argument("film")
+    p.add_argument("--bgm", default=None)
+    p.add_argument("--bgm-source", default="none", choices=["source", "new", "none"])
+    p.add_argument("--bgm-db", default="-14.0")
+    p.add_argument("--asr-dir", default=None)
+    p.add_argument("--width", default="1152")
+    p.add_argument("--height", default="2048")
+    p.add_argument("--skip-gate", action="store_true")
+    p.add_argument("--allow-uncaptioned", action="store_true")
+    p.set_defaults(func=cmd_assemble)
+
+    p = sub.add_parser("review-html")
+    p.add_argument("--film", default=None)
+    p.add_argument("--batch", default=None)
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=cmd_review_html)
+
+    p = sub.add_parser("export-hypit")
+    p.add_argument("film")
+    p.add_argument("--out", default=None)
+    p.add_argument("--width", default="1080")
+    p.add_argument("--height", default="1920")
+    p.add_argument("--fps", default="30")
+    p.set_defaults(func=cmd_export_hypit)
 
     args = ap.parse_args()
     return args.func(args)

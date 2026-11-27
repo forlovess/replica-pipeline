@@ -129,8 +129,25 @@ python -m replica_pipeline vlm-review-video FILM_DIR           # 独立 VLM 复�
 python -m replica_pipeline video-review FILM_DIR --shot S01    # 手动补录视频画面过检（绑 shot_sha256）
 python -m replica_pipeline allow-superres FILM_DIR
 python -m replica_pipeline audit-batch --batch .
+python -m replica_pipeline source-prepare FILM_DIR --source src.mp4 [--use-hypit] [--transcribe] # 读源切点/概览图
+python -m replica_pipeline estimate-speech --text "词句" --pace fast   # 语速与秒数测算
+python -m replica_pipeline lint-prompts FILM_DIR                    # 交 H3 前校验台词/时长/残句/禁言/锚点
+python -m replica_pipeline candidate-list FILM_DIR [--shot S01]     # 查看历史重抽候选
+python -m replica_pipeline candidate-archive FILM_DIR --shot S01 --clear # 归档保留旧渲染再重跑
+python -m replica_pipeline candidate-select FILM_DIR --shot S01 --candidate S01-attempt001
+python -m replica_pipeline assemble FILM_DIR --bgm qa/bgm.wav       # 去杂音 + 压Bgm(sidechain) + ASR抖音大字幕拼装
+python -m replica_pipeline review-html --batch .                    # 生成带时间戳评论区(FEEDBACK.json)与对比板审片页
+python -m replica_pipeline export-hypit FILM_DIR                    # 导出可编辑 Hypit SVML/SVRun 工程
 replica-pipeline status FILM_DIR   # console script
 ```
+
+## 吸收自 Hypit 的工程能力
+
+- **语速预测 + 单一口径 + Prompt 预检（`script_lint`）**：支持 `<display|spoken>` Dual Text、中文/混合音节秒数测算、拦截半截话残句（如「再一个就是」）、`BRIEF-RULES.json` 禁宣称拦截、以及 `<Picture 1>` / `<Audio 1>` / 时长过载预检（并在 `h3_submit` 自动门控）。
+- **Run Candidates 归档与回切（`candidates`）**：重抽 H3（`--reroll` 或 `candidate-archive --clear`）自动把旧视频、任务记录、4 帧联系表快照进 `shots/candidates/Sxx/attempt-NNN/`，随时 `candidate-select` 无损切回。
+- **声音压低与抖音大字幕拼装（`assemble`）**：语音 `-16 LUFS` 响度均衡 + `sidechaincompress` 对白避让压 BGM + 抖音去尾标点字幕 + 自动裁除开头杂音与静默。
+- **交互审片台 + 时间戳评论（`review-html`）**：成片播放器联动 ASR 句点跳转、同框对比板、各锁状态徽章与 `FEEDBACK.json` 时间戳意见导出。
+- **Hypit 双向桥接（`hypit_bridge`）**：`source-prepare` 优先走 `hypit media` / `hypit transcribe` 并本地回退；`export-hypit` 一键吐出标准 `@hypit/markup@1` `production.svml` 与 `render.svrun`。
 
 Exit `2` = 闸门拦截。
 

@@ -283,6 +283,7 @@ def apply_video_review(
     no_baked_captions: bool = True,
     no_hallucinated_tags: bool = True,
     person_consistent: bool = True,
+    reviewer: str = "manual",
     status: str = "PASS",
     note: str = "",
 ) -> dict[str, Any]:
@@ -316,6 +317,7 @@ def apply_video_review(
     shots = dict(data.get("shots") or {})
     entry: dict[str, Any] = {
         "status": final_status,
+        "reviewer": reviewer,
         "shot_sha256": file_sha256(vid),
         "contact_sheet": str(sheet.relative_to(film)),
         "size_stable": bool(size_stable),
@@ -335,7 +337,13 @@ def apply_video_review(
     return out
 
 
-def validate_visual_lock_data(data: dict[str, Any], film: Path, shots: list) -> list[str]:
+def validate_visual_lock_data(
+    data: dict[str, Any],
+    film: Path,
+    shots: list,
+    *,
+    require_vlm_reviewer: bool = True,
+) -> list[str]:
     errs: list[str] = []
     shot_map = data.get("shots") or {}
     for s in shots:
@@ -344,9 +352,14 @@ def validate_visual_lock_data(data: dict[str, Any], film: Path, shots: list) -> 
         if not isinstance(entry, dict):
             errs.append(
                 f"H3-VISUAL-LOCK.json: {sid} must be a structured review object "
-                "(run: replica-pipeline video-review ...)"
+                "(run: replica-pipeline vlm-review-video ...)"
             )
             continue
+        if require_vlm_reviewer and not str(entry.get("reviewer") or "").startswith("vlm:"):
+            errs.append(
+                f"H3-VISUAL-LOCK.json: {sid} reviewer must start with 'vlm:' "
+                "(run independent vlm-review-video; self-signing forbidden)"
+            )
         if str(entry.get("status") or "").upper() != "PASS":
             errs.append(f"H3-VISUAL-LOCK.json: {sid} visual review not PASS")
             continue

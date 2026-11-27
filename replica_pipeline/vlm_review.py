@@ -212,10 +212,10 @@ def review_still_with_vlm(
         f"- Image {i + 1}: {label} ({p.name})" for i, (label, p) in enumerate(refs)
     )
     cm = size_ctx.get("physical_cm") or {}
-    cm_str = f"{cm.get('w')}x{cm.get('h')}x{cm.get('d')}cm" if cm else size_ctx.get("phrase", "mini backpack")
+    cm_str = f"{cm.get('w')}x{cm.get('h')}x{cm.get('d')}cm" if cm else size_ctx.get("phrase", "target product")
     worn_rule = size_ctx.get("worn_rule") or (
-        "worn: bag width ~2/3 of back width (match worn_scale_ref); "
-        "handheld/table: forearm-length ~physical height; NOT travel-bag; NOT charm"
+        "judge product proportions strictly against physical_cm, size_diagram, worn_scale_ref, and canon_still "
+        "(must stay consistent across body/handheld scale; not oversized, not shrunken toy/charm)."
     )
     traits = _load_person_traits(film)
     phrase = size_ctx.get("phrase") or ""
@@ -225,15 +225,15 @@ def review_still_with_vlm(
         f"Reference images:\n{ref_desc or '- (none)'}\n"
         f"- Image {target_idx}: CANDIDATE STILL for shot {shot} ({still.name}).\n\n"
         f"Target product spec: {cm_str}.\n"
-        f"SIZE AUTHORITY (override any older 1/3–2/5 or ~1/2-back heuristics): {worn_rule}\n"
+        f"SIZE AUTHORITY (always override generic/guessed ratios): {worn_rule}\n"
         + (f"Size phrase: {phrase}\n" if phrase else "")
         + "When worn_scale_ref / size_diagram / canon_still are provided, judge scale against those images "
-        "and the SIZE AUTHORITY text — do NOT invent a smaller 'cute mini' target.\n"
+        "and SIZE AUTHORITY strictly.\n"
         + (f"Locked presenter traits: {traits}\n" if traits else "")
         + f"\nEvaluate ONLY Image {target_idx} strictly:\n"
         "1. size_match: Product matches SIZE AUTHORITY + ref images for this framing "
-        "(worn ≈ ~2/3 back width if that is the lock; handheld ≈ forearm / physical_cm). "
-        "Mark false only for clear travel-bag (~35–40cm+) OR charm/toy (~15cm) extremes, "
+        "(worn matches worn_scale_ref/canon_still; handheld matches physical_cm / forearm). "
+        "Mark false for oversized travel-size bloat, undersized charm/toy shrinkage, "
         "or clear mismatch vs worn_scale_ref/canon_still. Close-up framing that fills the frame is OK "
         "if hand/body scale still matches physical_cm.\n"
         "2. identity_match: All product design details match reference (pattern, applique, ears/pearls, bow, lace, no wrong color bow).\n"
@@ -300,10 +300,10 @@ def review_video_with_vlm(
         f"- Image {i + 1}: {label} ({p.name})" for i, (label, p) in enumerate(refs)
     )
     cm = size_ctx.get("physical_cm") or {}
-    cm_str = f"{cm.get('w')}x{cm.get('h')}x{cm.get('d')}cm" if cm else size_ctx.get("phrase", "mini backpack")
+    cm_str = f"{cm.get('w')}x{cm.get('h')}x{cm.get('d')}cm" if cm else size_ctx.get("phrase", "target product")
     worn_rule = size_ctx.get("worn_rule") or (
-        "worn: bag width ~2/3 of back width (match worn_scale_ref); "
-        "handheld/table: forearm-length ~physical height; NOT travel-bag; NOT charm"
+        "judge product proportions strictly against physical_cm, size_diagram, worn_scale_ref, and canon_still "
+        "(must stay consistent across body/handheld scale; not oversized, not shrunken)."
     )
 
     prompt = (
@@ -311,7 +311,7 @@ def review_video_with_vlm(
         f"Reference images:\n{ref_desc or '- (none)'}\n"
         f"- Image {target_idx}: 4-FRAME HORIZONTAL CONTACT SHEET (10%, 35%, 65%, 90%) from generated video {shot}.\n\n"
         f"Target product spec: {cm_str}.\n"
-        f"SIZE AUTHORITY (override older 1/3–2/5 or ~1/2-back heuristics): {worn_rule}\n"
+        f"SIZE AUTHORITY: {worn_rule}\n"
         f"Inspect all 4 frames in Image {target_idx} strictly:\n"
         "1. size_stable: Product size stays consistent across all 4 frames (false if it shrinks/bloats mid-clip).\n"
         "2. size_vs_spec: 'match' if scale matches SIZE AUTHORITY + refs across frames, else 'too_big', 'too_small', or 'drift'.\n"
@@ -394,4 +394,15 @@ def validate_vlm_still_review_data(
             errs.append(
                 f"VLM-STILL-REVIEW.json: {sid} still_sha256 mismatch — still changed since VLM review"
             )
+        refs_sha = entry.get("refs_sha256") or {}
+        if refs_sha:
+            cur_refs = {label: file_sha256(p) for label, p in _gather_still_refs(film, sid)[0]}
+            for label, exp_sha in refs_sha.items():
+                if label not in cur_refs:
+                    errs.append(f"VLM-STILL-REVIEW.json: {sid} reference '{label}' missing since VLM review")
+                elif cur_refs[label] != exp_sha:
+                    errs.append(
+                        f"VLM-STILL-REVIEW.json: {sid} reference '{label}' sha256 mismatch — "
+                        "canon/scale ref changed since VLM review"
+                    )
     return errs

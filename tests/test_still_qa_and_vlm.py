@@ -195,11 +195,27 @@ class VlmReviewTests(unittest.TestCase):
             },
             "codex-cli",
         )
-        with mock.patch("replica_pipeline.vlm_review.invoke_vlm", return_value=fake_pass):
+        with mock.patch("replica_pipeline.vlm_review.invoke_vlm", return_value=fake_pass) as m_vlm:
             entry2 = review_still_with_vlm(self.film, "S01")
         self.assertEqual(entry2["verdict"], "PASS")
+        prompt_sent = m_vlm.call_args.args[1]
+        self.assertNotIn("2/3 of back width", prompt_sent)
         doc2 = json.loads((self.film / "qa" / "VLM-STILL-REVIEW.json").read_text())
         self.assertEqual(validate_vlm_still_review_data(doc2, self.film, [{"id": "S01"}]), [])
+
+        # Changing a referenced scale image invalidates cached VLM pass via refs_sha256
+        ref = self.film / "qa" / "worn-scale-ref.jpg"
+        _make_jpg(ref, 576, 1024)
+        (self.film / "qa" / "SIZE-LOCK.json").write_text(
+            json.dumps({"source": "user_spec", "worn_scale_ref": "qa/worn-scale-ref.jpg"})
+        )
+        with mock.patch("replica_pipeline.vlm_review.invoke_vlm", return_value=fake_pass):
+            review_still_with_vlm(self.film, "S01")
+        doc3 = json.loads((self.film / "qa" / "VLM-STILL-REVIEW.json").read_text())
+        self.assertEqual(validate_vlm_still_review_data(doc3, self.film, [{"id": "S01"}]), [])
+        ref.write_bytes(b"changed-scale-diagram")
+        errs_ref = validate_vlm_still_review_data(doc3, self.film, [{"id": "S01"}])
+        self.assertTrue(any("worn_scale_ref" in e and "sha256 mismatch" in e for e in errs_ref), errs_ref)
 
         # Validate that pipeline.validate_stills blocks when any of the 4 locks is missing
         errs_stills = validate_stills(self.film)
