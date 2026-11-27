@@ -21,9 +21,11 @@ from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 
 try:
+    from .audio_stem import extract_source_stems
     from .script_lint import DUAL_TEXT_RE, extract_dialogue_segments, project_dual_text
     from .video_qa import ffprobe_duration
 except ImportError:
+    from audio_stem import extract_source_stems
     from script_lint import DUAL_TEXT_RE, extract_dialogue_segments, project_dual_text
     from video_qa import ffprobe_duration
 
@@ -191,8 +193,10 @@ def prepare_source(
     threshold: float = 0.35,
     use_hypit: bool = False,
     transcribe: bool = False,
+    extract_bgm: bool = False,
+    bgm_engine: str = "auto",
 ) -> dict[str, Any]:
-    """Run stage-1 source preparation: probe, cuts, optional WhisperX, overview tile, source.json."""
+    """Run stage-1 source preparation: probe, optional stem split, cuts, ASR, overview tile."""
     film = Path(film)
     source = Path(source)
     qa_dir = film / "qa"
@@ -201,6 +205,14 @@ def prepare_source(
     probe = probe_source_video(source, use_hypit=use_hypit)
     dur = float(probe.get("duration") or 0.0)
     cuts = detect_source_boundaries(source, threshold=threshold, use_hypit=use_hypit)
+
+    stem_info: dict[str, Any] | None = None
+    transcribe_input = source
+    if extract_bgm:
+        stem_info = extract_source_stems(film, source, engine=bgm_engine)
+        voc_rel = stem_info.get("vocals")
+        if voc_rel and (film / voc_rel).is_file():
+            transcribe_input = film / voc_rel
 
     cuts_path = qa_dir / "cuts.json"
     cuts_payload = {
@@ -219,7 +231,7 @@ def prepare_source(
             [
                 "hypit",
                 "transcribe",
-                str(source),
+                str(transcribe_input),
                 "--language",
                 language,
                 "--to",
@@ -244,7 +256,7 @@ def prepare_source(
     )
 
     src_json = qa_dir / "source.json"
-    src_payload = {
+    src_payload: dict[str, Any] = {
         "path": str(source),
         "duration": dur,
         "width": probe.get("width"),
@@ -257,6 +269,13 @@ def prepare_source(
         "engine": "hypit" if (use_hypit and has_hypit()) else "ffmpeg",
         "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    if stem_info is not None:
+        src_payload["stem_split"] = {
+            "path": "qa/STEM-SPLIT.json",
+            "usable_bgm": stem_info.get("usable_bgm"),
+            "bgm": stem_info.get("bgm"),
+            "vocals": stem_info.get("vocals"),
+        }
     src_json.write_text(json.dumps(src_payload, ensure_ascii=False, indent=2) + "\n")
     return src_payload
 

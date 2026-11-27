@@ -151,17 +151,28 @@ def build_ducking_filter(
 ) -> str:
     """Build ffmpeg filter_complex normalizing speech (-16 LUFS) and ducking BGM underneath."""
     total_dur = max(0.5, float(total_dur))
-    fade_out_st = max(0.0, total_dur - fade_out)
+    fi = min(float(fade_in), total_dur * 0.35)
+    fo = min(float(fade_out), total_dur * 0.45)
+    fade_out_st = max(0.0, total_dur - fo)
     return (
-        "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11,asplit=2[vo][vo_sc];"
+        "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,asplit=2[vo][vo_sc];"
         f"[1:a]atrim=0:{total_dur:.3f},asetpts=PTS-STARTPTS,"
+        f"aresample=48000,aformat=channel_layouts=stereo,"
         f"volume={bgm_db:.1f}dB,"
-        f"afade=t=in:st=0:d={fade_in:.2f},"
-        f"afade=t=out:st={fade_out_st:.3f}:d={fade_out:.2f}[bgm_raw];"
+        f"afade=t=in:st=0:d={fi:.2f},"
+        f"afade=t=out:st={fade_out_st:.3f}:d={fo:.2f}[bgm_raw];"
         "[bgm_raw][vo_sc]sidechaincompress="
         "threshold=0.04:ratio=5:attack=40:release=350:makeup=1[bgm_ducked];"
         "[vo][bgm_ducked]amix=inputs=2:duration=first:dropout_transition=0.25[aout]"
     )
+
+
+def _audio_has_signal(video_path: Path, *, min_db: float = -75.0) -> bool:
+    try:
+        dbs = audio_db_bins(video_path)
+        return any(db > min_db for db in dbs)
+    except Exception:
+        return False
 
 
 def mix_audio_with_ducking(
@@ -171,13 +182,26 @@ def mix_audio_with_ducking(
     *,
     bgm_db: float = -14.0,
 ) -> Path:
-    """Mux normalized voice with sidechain-ducked looped BGM into out_path."""
+    """Mux normalized voice with sidechain-ducked looped BGM (or pure BGM on silent tracks)."""
     video_path = Path(video_path)
     bgm_path = Path(bgm_path)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    dur = ffprobe_duration(video_path)
-    fc = build_ducking_filter(total_dur=dur, bgm_db=bgm_db)
+    dur = max(0.5, ffprobe_duration(video_path))
+    if _audio_has_signal(video_path):
+        fc = build_ducking_filter(total_dur=dur, bgm_db=bgm_db)
+    else:
+        # Pure digital silence crashes loudnorm with NaN; lay trimmed/faded BGM cleanly.
+        fi = min(0.6, dur * 0.35)
+        fo = min(1.2, dur * 0.45)
+        fade_out_st = max(0.0, dur - fo)
+        fc = (
+            f"[1:a]atrim=0:{dur:.3f},asetpts=PTS-STARTPTS,"
+            f"aresample=48000,aformat=channel_layouts=stereo,"
+            f"volume={bgm_db:.1f}dB,"
+            f"afade=t=in:st=0:d={fi:.2f},"
+            f"afade=t=out:st={fade_out_st:.3f}:d={fo:.2f}[aout]"
+        )
     tmp = out_path.with_suffix(".part.mp4")
     subprocess.run(
         [
@@ -687,7 +711,7 @@ def assemble_film(
     *,
     bgm_path: Path | None = None,
     bgm_source: str = "none",
-    bgm_db: float = -14.0,
+    bgm_db: float | None = None,
     asr_dir: Path | None = None,
     width: int = 1152,
     height: int = 2048,
@@ -763,8 +787,10 @@ def assemble_film(
     strict_bgm = film / "qa" / "strict-with-bgm.mp4"
     bgm_file = Path(bgm_path) if bgm_path else next((film / "qa").glob("bgm.*"), None)
     eff_bgm_source = bgm_source if bgm_source in {"source", "new", "none"} else "none"
+    has_spoken = any(phrases for _, _, _, _, _, phrases in trim_jobs)
+    eff_bgm_db = float(bgm_db) if bgm_db is not None else (-14.0 if has_spoken else -4.0)
     if bgm_file and bgm_file.is_file():
-        mix_audio_with_ducking(raw_concat, bgm_file, strict_bgm, bgm_db=bgm_db)
+        mix_audio_with_ducking(raw_concat, bgm_file, strict_bgm, bgm_db=eff_bgm_db)
         if eff_bgm_source == "none":
             eff_bgm_source = "source"
     else:

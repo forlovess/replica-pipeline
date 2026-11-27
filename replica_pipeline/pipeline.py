@@ -968,7 +968,7 @@ def cmd_audit_batch(args: argparse.Namespace) -> int:
 
 
 def cmd_source_prepare(args: argparse.Namespace) -> int:
-    """Prepare stage-1 source artifacts (probe, cuts.json, overview grid, optional ASR)."""
+    """Prepare stage-1 source artifacts (probe, optional BGM stem split, cuts, ASR, overview)."""
     try:
         from .hypit_bridge import prepare_source
     except ImportError:
@@ -981,7 +981,31 @@ def cmd_source_prepare(args: argparse.Namespace) -> int:
         threshold=float(args.threshold),
         use_hypit=bool(args.use_hypit),
         transcribe=bool(args.transcribe),
+        extract_bgm=bool(args.extract_bgm),
+        bgm_engine=args.bgm_engine,
     )
+    print(json.dumps({"ok": True, **res}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_extract_bgm(args: argparse.Namespace) -> int:
+    """Separate source vocals (qa/source-vocals.wav) and usable BGM (qa/bgm.wav)."""
+    try:
+        from .audio_stem import extract_source_stems
+    except ImportError:
+        from audio_stem import extract_source_stems
+
+    try:
+        res = extract_source_stems(
+            Path(args.film),
+            Path(args.source),
+            engine=args.engine,
+            model=args.model,
+            force=bool(args.force),
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
     print(json.dumps({"ok": True, **res}, ensure_ascii=False, indent=2))
     return 0
 
@@ -1076,7 +1100,7 @@ def cmd_assemble(args: argparse.Namespace) -> int:
             Path(args.film),
             bgm_path=Path(args.bgm) if args.bgm else None,
             bgm_source=args.bgm_source,
-            bgm_db=float(args.bgm_db),
+            bgm_db=float(args.bgm_db) if args.bgm_db is not None else None,
             asr_dir=Path(args.asr_dir) if args.asr_dir else None,
             width=int(args.width),
             height=int(args.height),
@@ -1273,7 +1297,17 @@ def main() -> int:
     p.add_argument("--threshold", default="0.35")
     p.add_argument("--use-hypit", action="store_true")
     p.add_argument("--transcribe", action="store_true")
+    p.add_argument("--extract-bgm", action="store_true")
+    p.add_argument("--bgm-engine", default="auto", choices=["auto", "demucs", "audio-separator", "center-cancel"])
     p.set_defaults(func=cmd_source_prepare)
+
+    p = sub.add_parser("extract-bgm")
+    p.add_argument("film")
+    p.add_argument("--source", required=True)
+    p.add_argument("--engine", default="auto", choices=["auto", "demucs", "audio-separator", "center-cancel"])
+    p.add_argument("--model", default="htdemucs")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_extract_bgm)
 
     p = sub.add_parser("lint-prompts")
     p.add_argument("film")
@@ -1312,7 +1346,7 @@ def main() -> int:
     p.add_argument("film")
     p.add_argument("--bgm", default=None)
     p.add_argument("--bgm-source", default="none", choices=["source", "new", "none"])
-    p.add_argument("--bgm-db", default="-14.0")
+    p.add_argument("--bgm-db", default=None)
     p.add_argument("--asr-dir", default=None)
     p.add_argument("--width", default="1152")
     p.add_argument("--height", default="2048")

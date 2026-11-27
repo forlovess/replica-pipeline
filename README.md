@@ -129,7 +129,8 @@ python -m replica_pipeline vlm-review-video FILM_DIR           # 独立 VLM 复�
 python -m replica_pipeline video-review FILM_DIR --shot S01    # 手动补录视频画面过检（绑 shot_sha256）
 python -m replica_pipeline allow-superres FILM_DIR
 python -m replica_pipeline audit-batch --batch .
-python -m replica_pipeline source-prepare FILM_DIR --source src.mp4 [--use-hypit] [--transcribe] # 读源切点/概览图
+python -m replica_pipeline source-prepare FILM_DIR --source src.mp4 [--extract-bgm] [--use-hypit] [--transcribe]
+python -m replica_pipeline extract-bgm FILM_DIR --source src.mp4 [--engine auto|demucs|audio-separator|center-cancel] # 剥离原片人声与可用BGM
 python -m replica_pipeline estimate-speech --text "词句" --pace fast   # 语速与秒数测算
 python -m replica_pipeline lint-prompts FILM_DIR                    # 交 H3 前校验台词/时长/残句/禁言/锚点
 python -m replica_pipeline candidate-list FILM_DIR [--shot S01]     # 查看历史重抽候选
@@ -143,6 +144,7 @@ replica-pipeline status FILM_DIR   # console script
 
 ## 吸收自 Hypit 的工程能力
 
+- **原片人声 / BGM 剥离与自动接管（`audio_stem`）**：`extract-bgm`（或 `source-prepare --extract-bgm`）优先走 Demucs（`htdemucs --two-stems=vocals`）或 `audio-separator` 把原片拆成 `qa/source-vocals.wav` + `qa/bgm.wav`，实测伴奏有效响度（空人声干片不会硬留底噪），随后 `assemble` 自动用 H3 新配音并把原片 BGM 用 `sidechaincompress` 压在底下（无配音新片则直接铺原 BGM）。
 - **语速预测 + 单一口径 + Prompt 预检（`script_lint`）**：支持 `<display|spoken>` Dual Text、中文/混合音节秒数测算、拦截半截话残句（如「再一个就是」）、`BRIEF-RULES.json` 禁宣称拦截、以及 `<Picture 1>` / `<Audio 1>` / 时长过载预检（并在 `h3_submit` 自动门控）。
 - **Run Candidates 归档与回切（`candidates`）**：重抽 H3（`--reroll` 或 `candidate-archive --clear`）自动把旧视频、任务记录、4 帧联系表快照进 `shots/candidates/Sxx/attempt-NNN/`，随时 `candidate-select` 无损切回。
 - **声音压低与抖音大字幕拼装（`assemble`）**：语音 `-16 LUFS` 响度均衡 + `sidechaincompress` 对白避让压 BGM + 抖音去尾标点字幕 + 自动裁除开头杂音与静默。
