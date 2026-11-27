@@ -1,6 +1,6 @@
 [project]
 name = "replica-pipeline"
-version = "0.4.0"
+version = "0.5.0"
 description = "Fail-closed production pipeline that forces /replica skill stages before H3 submit"
 readme = "README.md"
 requires-python = ">=3.10"
