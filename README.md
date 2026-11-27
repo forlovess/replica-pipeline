@@ -4,6 +4,9 @@ Fail-closed backend that forces the `/replica` skill order on every film.
 
 ## Film-level locks
 
+### Stills preferred path
+Hypit cut source → extract each shot t0 → AI **product-replace** on that frame (lock SKU style + size; keep person/place/pose). Do not free-paint a new scene when a source opening frame exists.
+
 ### Person (remake continuity — no free casting)
 - Cast from `presenter-place.md`, then lock `qa/PERSON-LOCK.json` to the remake canon still (usually S01).
 - Later shots must match **that remake person** (hair/outfit/likeness). Not source face-ID; not free improvisation.

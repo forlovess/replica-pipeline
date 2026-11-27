@@ -15,7 +15,7 @@ STAGE_TITLE = {
     "1_read_source": "读源片（时长/切镜/人物场所/ASR）",
     "2_vo_adapt": "口播 extract-then-adapt（密度锁）",
     "3_beat_plan": "拍表（源切点/意群 → 4–15s）",
-    "4_stills": "双锁静帧（身份+比例）",
+    "4_stills": "静帧（源首帧换品：身份+比例+人物）",
     "5_h3": "H3 生成 + 听感",
     "6_assemble": "字幕 + BGM 拼装",
     "7_superres": "超分（须用户确认）",
