@@ -19,6 +19,7 @@ from pathlib import Path
 
 try:
     from .gate import require as pipeline_require
+    from .video_qa import extract_shot_contact_sheet
     from .voice_lock import (
         ensure_voice_lock,
         first_shot_id,
@@ -27,6 +28,7 @@ try:
     )
 except ImportError:  # flat `_pipeline/` on disk
     from gate import require as pipeline_require
+    from video_qa import extract_shot_contact_sheet
     from voice_lock import (
         ensure_voice_lock,
         first_shot_id,
@@ -197,6 +199,29 @@ def run(film: Path, shot: str, duration: float = 10.0, seed: int = 83) -> int:
 
     active_task_guard(film / "tasks", taskf)
 
+    if state.get("task_id"):
+        # Fail closed if still, prompt, or S01 voice-lock wav changed since task_id was issued.
+        cur_frame_sha = hashlib.sha256(frame.read_bytes()).hexdigest()
+        s01 = first_shot_id(film)
+        effective_prompt = prompt if shot == s01 else inject_audio_tag(prompt)
+        cur_prompt_sha = hashlib.sha256(effective_prompt.encode()).hexdigest()
+        stale_reasons = []
+        if state.get("frame_sha256") and state["frame_sha256"] != cur_frame_sha:
+            stale_reasons.append("first-frame still")
+        if state.get("prompt_sha256") and state["prompt_sha256"] != cur_prompt_sha:
+            stale_reasons.append("prompt")
+        if shot != s01 and state.get("voice_sha256"):
+            vpath = voice_lock_path(film)
+            if vpath.is_file():
+                cur_voice_sha = hashlib.sha256(vpath.read_bytes()).hexdigest()
+                if state["voice_sha256"] != cur_voice_sha:
+                    stale_reasons.append("S01-voice.wav")
+        if stale_reasons:
+            raise SystemExit(
+                f"STALE TASK for {shot}: {', '.join(stale_reasons)} changed since submission "
+                f"(task_id={state['task_id']}). Archive/remove {taskf} before resubmitting."
+            )
+
     if not state.get("task_id"):
         if state.get("state") in {"SUBMITTING", "UNCERTAIN_SUBMIT"}:
             raise SystemExit("Submission uncertain; do not repost")
@@ -326,6 +351,13 @@ def run(film: Path, shot: str, duration: float = 10.0, seed: int = 83) -> int:
             log(shot, "VOICE_LOCK", meta.get("wav"), f"{meta.get('duration_sec')}s")
         except Exception as e:
             log(shot, "VOICE_LOCK_WARN", type(e).__name__, str(e)[:160])
+
+    # Extract 4-frame contact sheet for mandatory visual QA
+    try:
+        sheet = extract_shot_contact_sheet(film, shot)
+        log(shot, "CONTACT_SHEET", sheet)
+    except Exception as e:
+        log(shot, "CONTACT_SHEET_WARN", type(e).__name__, str(e)[:160])
 
     print(
         json.dumps(

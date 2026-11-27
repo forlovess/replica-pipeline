@@ -1,10 +1,24 @@
 """Film-level voice lock: extract S01 spoken audio and reuse on later shots."""
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import time
 from pathlib import Path
+
+try:
+    from .video_qa import scan_audio_glitches
+except ImportError:
+    from video_qa import scan_audio_glitches
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def first_shot_id(film: Path) -> str:
@@ -45,30 +59,38 @@ def extract_voice_from_shot(
     out_dir = voice_lock_dir(film)
     out_dir.mkdir(parents=True, exist_ok=True)
     wav = voice_lock_path(film)
-    if wav.is_file() and not force:
-        return json.loads(voice_meta_path(film).read_text()) if voice_meta_path(film).is_file() else {
-            "wav": str(wav.relative_to(film)),
-            "source_shot": shot,
-            "skipped": True,
-        }
+    src_sha = _file_sha256(src)
+    meta_p = voice_meta_path(film)
+    if wav.is_file() and meta_p.is_file() and not force:
+        existing = json.loads(meta_p.read_text())
+        if existing.get("source_sha256") == src_sha:
+            return existing
 
-    # Prefer mid-speech: skip tiny head silence, take up to max_sec
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-v",
-        "error",
-        "-i",
-        str(src),
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-t",
-        str(max_sec),
-        str(wav),
-    ]
+    # Skip leading silence or isolated glitch burst so S01-voice.wav holds clean speech.
+    trim_start = 0.0
+    try:
+        glitch_info = scan_audio_glitches(src)
+        trim_start = float(glitch_info["recommended_trim"][0])
+    except Exception:
+        trim_start = 0.0
+
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    if trim_start > 0.05:
+        cmd.extend(["-ss", f"{trim_start:.3f}"])
+    cmd.extend(
+        [
+            "-i",
+            str(src),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-t",
+            str(max_sec),
+            str(wav),
+        ]
+    )
     subprocess.run(cmd, check=True)
 
     # Duration probe
@@ -91,6 +113,8 @@ def extract_voice_from_shot(
 
     meta = {
         "source_shot": shot,
+        "source_sha256": src_sha,
+        "trim_start_sec": trim_start,
         "wav": str(wav.relative_to(film)),
         "sample_rate": 16000,
         "channels": 1,
@@ -103,16 +127,10 @@ def extract_voice_from_shot(
         "rule": "S02+ must submit ref2v with referenceAudiosBase64=[this wav] + still as referenceImagesBase64",
         "extracted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-    voice_meta_path(film).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2) + "\n"
-    )
+    meta_p.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
     return meta
 
 
 def ensure_voice_lock(film: Path, *, force: bool = False) -> dict:
     film = Path(film)
-    meta_p = voice_meta_path(film)
-    wav = voice_lock_path(film)
-    if wav.is_file() and meta_p.is_file() and not force:
-        return json.loads(meta_p.read_text())
     return extract_voice_from_shot(film, force=force)

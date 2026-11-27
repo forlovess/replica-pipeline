@@ -15,9 +15,9 @@ STAGE_TITLE = {
     "1_read_source": "读源片（时长/切镜/人物场所/ASR）",
     "2_vo_adapt": "口播 extract-then-adapt（密度锁）",
     "3_beat_plan": "拍表（源切点/意群 → 4–15s）",
-    "4_stills": "静帧（源首帧换品：身份+比例+人物）",
-    "5_h3": "H3 生成 + 听感",
-    "6_assemble": "字幕 + BGM（优先源配乐）",
+    "4_stills": "静帧（几何校验 + 同框对比 + 独立VLM复审）",
+    "5_h3": "H3 生成 + 听感 + 抽帧画面锁",
+    "6_assemble": "口播去杂音 + ASR逐字字幕 + BGM",
     "7_superres": "超分（须用户确认）",
 }
 
@@ -37,13 +37,16 @@ REQUIRED = {
         "qa/REBEAT-PLAN.json",  # shots[] with sec in [4,15], source basis
     ],
     "4_stills": [
-        "qa/STILL-PRODUCT-LOCK.md",
-        "qa/SIZE-LOCK.json",  # film-level product scale (user_spec | first_frame)
-        "qa/PERSON-LOCK.json",  # same presenter across shots (source-level continuity)
+        "qa/STILL-PRODUCT-LOCK.json",  # structured product identity + geometry lock (still_sha256)
+        "qa/VLM-STILL-REVIEW.json",    # independent VLM review bound to still_sha256
+        "qa/still-contact-sheet.jpg",  # labeled side-by-side board (refs + S01..Sxx)
+        "qa/still-contact-sheet.json", # board manifest: per-cell sha256, invalidates on redraw
+        "qa/SIZE-LOCK.json",           # film-level product scale (user_spec | first_frame)
+        "qa/PERSON-LOCK.json",         # structured presenter continuity across shots
     ],
     "5_h3": [
-        # validated dynamically: every beat shot has shots/Sxx.mp4 + meaning pass note
-        # + VOICE-LOCK.json after S01 (S02+ must reuse that wav via ref2v)
+        "qa/H3-VISUAL-LOCK.json",  # per-shot 4-frame contact sheet review bound by shot_sha256
+        # plus dynamically: shots/Sxx.mp4 + H3-MEANING.md PASS + S01 VOICE-LOCK + ref2v
     ],
     "6_assemble": [
         "qa/captioned.mp4",

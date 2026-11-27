@@ -114,6 +114,8 @@ def artifacts_present(film: Path, stage: str) -> tuple[bool, list[str]]:
         missing.extend(validate_stills(film))
     if stage == "5_h3":
         missing.extend(validate_h3(film))
+    if stage == "6_assemble":
+        missing.extend(validate_assemble(film))
     if stage == "2_vo_adapt":
         missing.extend(validate_vo_density(film))
     if stage == "7_superres":
@@ -206,29 +208,56 @@ def validate_stills(film: Path) -> list[str]:
     if not plan.is_file():
         return ["qa/REBEAT-PLAN.json required before stills"]
     shots = json.loads(plan.read_text()).get("shots") or []
-    lock = film / "qa/STILL-PRODUCT-LOCK.md"
-    lock_txt = lock.read_text() if lock.is_file() else ""
+
+    try:
+        from .still_qa import (
+            check_still_geometry,
+            validate_product_lock_data,
+            validate_still_sheet,
+        )
+        from .vlm_review import VLM_STILL_LOCK_NAME, validate_vlm_still_review_data
+    except ImportError:
+        from still_qa import (
+            check_still_geometry,
+            validate_product_lock_data,
+            validate_still_sheet,
+        )
+        from vlm_review import VLM_STILL_LOCK_NAME, validate_vlm_still_review_data
+
     for s in shots:
         sid = s["id"]
         still = film / "first-frames" / "h3" / f"{sid}-first.jpg"
         if not still.is_file():
-            # also accept first-frames/Sxx.jpg + note h3 missing
             alt = film / "first-frames" / f"{sid}.jpg"
             if not alt.is_file():
                 errs.append(f"missing still {sid}")
             else:
                 errs.append(f"missing h3 still first-frames/h3/{sid}-first.jpg")
-        # require PASS mention in lock file
-        if lock_txt and sid in lock_txt:
-            # crude: look for S01 ... PASS nearby
-            if not re.search(rf"{sid}[^\n]*PASS", lock_txt) and not re.search(
-                rf"\|\s*{sid}\s*\|[^\n]*PASS", lock_txt
-            ):
-                # allow summary line "S01–S07 PASS" style
-                if not re.search(rf"{sid}.*PASS|PASS.*{sid}|全部.*PASS|S0\d–S0\d.*PASS", lock_txt):
-                    errs.append(f"{sid}: not marked PASS in STILL-PRODUCT-LOCK.md")
-        elif lock.is_file():
-            errs.append(f"{sid}: not found in STILL-PRODUCT-LOCK.md")
+            continue
+        geo_ok, _, geo_errs = check_still_geometry(still)
+        if not geo_ok:
+            errs.extend(geo_errs)
+
+    errs.extend(validate_still_sheet(film, shots))
+
+    prod_p = film / "qa/STILL-PRODUCT-LOCK.json"
+    if not prod_p.is_file():
+        errs.append("qa/STILL-PRODUCT-LOCK.json required (run: product-review)")
+    else:
+        try:
+            errs.extend(validate_product_lock_data(json.loads(prod_p.read_text()), film, shots))
+        except Exception as e:
+            errs.append(f"STILL-PRODUCT-LOCK.json: {e}")
+
+    vlm_p = film / VLM_STILL_LOCK_NAME
+    if not vlm_p.is_file():
+        errs.append(f"{VLM_STILL_LOCK_NAME} required (run: vlm-review-still)")
+    else:
+        try:
+            errs.extend(validate_vlm_still_review_data(json.loads(vlm_p.read_text()), film, shots))
+        except Exception as e:
+            errs.append(f"VLM-STILL-REVIEW.json: {e}")
+
     errs.extend(validate_size_lock(film, shots))
     errs.extend(validate_person_lock(film, shots))
     return errs
@@ -253,6 +282,14 @@ def validate_person_lock(film: Path, shots: list) -> list[str]:
     return validate_person_lock_data(data, film, shots)
 
 
+def validate_assemble(film: Path) -> list[str]:
+    try:
+        from .assemble_tools import validate_assemble_data
+    except ImportError:
+        from assemble_tools import validate_assemble_data
+    return validate_assemble_data(film)
+
+
 def validate_h3(film: Path) -> list[str]:
     errs = []
     plan = film / "qa/REBEAT-PLAN.json"
@@ -270,16 +307,48 @@ def validate_h3(film: Path) -> list[str]:
             errs.append(f"{sid}: meaning PASS missing in qa/H3-MEANING.md")
     if not meaning.is_file():
         errs.append("qa/H3-MEANING.md required")
+
+    # Post-H3 visual QA (size stability, identity, no baked captions/tags, person continuity)
+    vlock_p = film / "qa/H3-VISUAL-LOCK.json"
+    if not vlock_p.is_file():
+        errs.append("qa/H3-VISUAL-LOCK.json required (run inspect-shots + video-review)")
+    else:
+        try:
+            vlock_data = json.loads(vlock_p.read_text())
+            try:
+                from .video_qa import validate_visual_lock_data
+            except ImportError:
+                from video_qa import validate_visual_lock_data
+            errs.extend(validate_visual_lock_data(vlock_data, film, shots))
+        except Exception as e:
+            errs.append(f"H3-VISUAL-LOCK.json: {e}")
+
     # Film-level voice lock required once more than one shot exists and S01 is on disk
     if len(shots) >= 2:
         s01 = shots[0]["id"]
-        if (film / "shots" / f"{s01}.mp4").is_file():
+        s01_vid = film / "shots" / f"{s01}.mp4"
+        if s01_vid.is_file():
             vjson = film / "qa/VOICE-LOCK.json"
             vwav = film / "qa/voice-lock/S01-voice.wav"
             if not vwav.is_file():
                 errs.append("qa/voice-lock/S01-voice.wav required (extract from S01)")
             if not vjson.is_file():
                 errs.append("qa/VOICE-LOCK.json required")
+            else:
+                try:
+                    vmeta = json.loads(vjson.read_text())
+                    src_sha = vmeta.get("source_sha256")
+                    if src_sha:
+                        try:
+                            from .video_qa import file_sha256
+                        except ImportError:
+                            from video_qa import file_sha256
+                        if file_sha256(s01_vid) != src_sha:
+                            errs.append(
+                                f"VOICE-LOCK.json: {s01}.mp4 changed since extract-voice — rerun extract-voice --force"
+                            )
+                except Exception as e:
+                    errs.append(f"VOICE-LOCK.json: {e}")
             # later shots must have been submitted with voice ref recorded
             for s in shots[1:]:
                 sid = s["id"]
@@ -440,6 +509,40 @@ def cmd_require(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if plan.is_file():
+            plan_shots = json.loads(plan.read_text()).get("shots") or []
+            person_errs = validate_person_lock(film, plan_shots)
+            if person_errs:
+                print(
+                    "GATE FAIL: PERSON-LOCK evidence:\n  - "
+                    + "\n  - ".join(person_errs),
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                from .still_qa import validate_product_lock_data, validate_still_sheet
+                from .vlm_review import VLM_STILL_LOCK_NAME, validate_vlm_still_review_data
+            except ImportError:
+                from still_qa import validate_product_lock_data, validate_still_sheet
+                from vlm_review import VLM_STILL_LOCK_NAME, validate_vlm_still_review_data
+            prod_p = film / "qa/STILL-PRODUCT-LOCK.json"
+            vlm_p = film / VLM_STILL_LOCK_NAME
+            extra_errs = validate_still_sheet(film, plan_shots)
+            if not prod_p.is_file():
+                extra_errs.append("missing qa/STILL-PRODUCT-LOCK.json")
+            else:
+                extra_errs.extend(validate_product_lock_data(json.loads(prod_p.read_text()), film, plan_shots))
+            if not vlm_p.is_file():
+                extra_errs.append(f"missing {VLM_STILL_LOCK_NAME} (run vlm-review-still)")
+            else:
+                extra_errs.extend(validate_vlm_still_review_data(json.loads(vlm_p.read_text()), film, plan_shots))
+            if extra_errs:
+                print(
+                    "GATE FAIL: PRE-H3 STILL EVIDENCE:\n  - "
+                    + "\n  - ".join(extra_errs),
+                    file=sys.stderr,
+                )
+                return 2
         # S02+ require S01 voice bank
         if shot != first_id:
             vwav = film / "qa/voice-lock/S01-voice.wav"
@@ -597,12 +700,203 @@ def cmd_size_review(args: argparse.Namespace) -> int:
             refs_used=refs,
             note=args.note or "",
             status=args.status,
+            film=film,
         )
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 3
 
     write_size_lock(film, data)
+    print(
+        json.dumps(
+            {"ok": True, "shot": args.shot, "entry": data["shots"][args.shot]},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_person_review(args: argparse.Namespace) -> int:
+    """Record structured presenter continuity evidence for one shot."""
+    try:
+        from .person_lock import apply_person_review, write_person_lock
+    except ImportError:
+        from person_lock import apply_person_review, write_person_lock
+
+    film = Path(args.film)
+    path = film / "qa" / "PERSON-LOCK.json"
+    if not path.is_file():
+        print(f"PERSON-LOCK.json missing: {path}", file=sys.stderr)
+        return 2
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        print(f"PERSON-LOCK.json: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        data = apply_person_review(
+            data,
+            args.shot,
+            same_person=not args.person_mismatch,
+            same_outfit=not args.outfit_mismatch,
+            same_place=not args.place_mismatch,
+            note=args.note or "",
+            status=args.status,
+            film=film,
+        )
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 3
+
+    write_person_lock(film, data)
+    print(
+        json.dumps(
+            {"ok": True, "shot": args.shot, "entry": data["shots"][args.shot]},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_inspect_stills(args: argparse.Namespace) -> int:
+    """Check still geometry/aspect ratios and build qa/still-contact-sheet.jpg."""
+    try:
+        from .still_qa import inspect_film_stills
+    except ImportError:
+        from still_qa import inspect_film_stills
+
+    res = inspect_film_stills(Path(args.film))
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0 if res["ok"] else 2
+
+
+def cmd_product_review(args: argparse.Namespace) -> int:
+    """Record structured pre-H3 product identity/geometry review bound to still_sha256."""
+    try:
+        from .still_qa import PRODUCT_LOCK_NAME, apply_product_review, build_product_lock
+    except ImportError:
+        from still_qa import PRODUCT_LOCK_NAME, apply_product_review, build_product_lock
+
+    film = Path(args.film)
+    path = film / PRODUCT_LOCK_NAME
+    data = json.loads(path.read_text()) if path.is_file() else build_product_lock()
+    try:
+        data = apply_product_review(
+            film,
+            data,
+            args.shot,
+            features_intact=not args.features_fail,
+            no_wrong_variant=not args.wrong_variant,
+            no_hallucinated_tags=not args.hallucinated_tags,
+            status=args.status,
+            note=args.note or "",
+        )
+    except (FileNotFoundError, ValueError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    print(json.dumps({"ok": True, "shot": args.shot, "entry": data["shots"][args.shot]}, ensure_ascii=False))
+    return 0
+
+
+def _shot_ids_for_film(film: Path, shot_arg: str | None) -> list[str]:
+    if shot_arg:
+        return [shot_arg]
+    plan = film / "qa" / "REBEAT-PLAN.json"
+    if plan.is_file():
+        return [s["id"] for s in (json.loads(plan.read_text()).get("shots") or [])]
+    return sorted(p.stem.replace("-first", "") for p in (film / "first-frames" / "h3").glob("S*-first.jpg"))
+
+
+def cmd_vlm_review_still(args: argparse.Namespace) -> int:
+    """Run independent VLM review on pre-H3 first-frame still(s)."""
+    try:
+        from .vlm_review import review_still_with_vlm
+    except ImportError:
+        from vlm_review import review_still_with_vlm
+
+    film = Path(args.film)
+    sids = _shot_ids_for_film(film, args.shot)
+    out = {}
+    all_pass = True
+    for sid in sids:
+        entry = review_still_with_vlm(film, sid, provider=args.provider)
+        out[sid] = entry
+        if entry["verdict"] != "PASS":
+            all_pass = False
+    print(json.dumps({"ok": all_pass, "film": film.name, "shots": out}, ensure_ascii=False, indent=2))
+    return 0 if all_pass else 2
+
+
+def cmd_vlm_review_video(args: argparse.Namespace) -> int:
+    """Run independent VLM review on post-H3 4-frame video contact sheet(s)."""
+    try:
+        from .vlm_review import review_video_with_vlm
+    except ImportError:
+        from vlm_review import review_video_with_vlm
+
+    film = Path(args.film)
+    sids = _shot_ids_for_film(film, args.shot)
+    out = {}
+    all_pass = True
+    for sid in sids:
+        entry = review_video_with_vlm(film, sid, provider=args.provider)
+        out[sid] = entry
+        if entry["status"] != "PASS":
+            all_pass = False
+    print(json.dumps({"ok": all_pass, "film": film.name, "shots": out}, ensure_ascii=False, indent=2))
+    return 0 if all_pass else 2
+
+
+def cmd_inspect_shots(args: argparse.Namespace) -> int:
+    """Extract 4-frame contact sheets and scan audio glitches for H3 shots."""
+    try:
+        from .video_qa import inspect_film_shots
+    except ImportError:
+        from video_qa import inspect_film_shots
+
+    film = Path(args.film)
+    results = inspect_film_shots(film, shot_id=args.shot)
+    print(json.dumps({"ok": True, "film": film.name, "shots": results}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_video_review(args: argparse.Namespace) -> int:
+    """Record post-H3 visual review bound to current shot_sha256."""
+    try:
+        from .video_qa import VISUAL_LOCK_NAME, apply_video_review, build_visual_lock
+    except ImportError:
+        from video_qa import VISUAL_LOCK_NAME, apply_video_review, build_visual_lock
+
+    film = Path(args.film)
+    path = film / VISUAL_LOCK_NAME
+    if path.is_file():
+        data = json.loads(path.read_text())
+    else:
+        data = build_visual_lock()
+
+    try:
+        data = apply_video_review(
+            film,
+            data,
+            args.shot,
+            size_stable=not args.size_drift,
+            size_vs_spec=args.size_vs_spec,
+            identity_intact=not args.identity_fail,
+            no_baked_captions=not args.baked_captions,
+            no_hallucinated_tags=not args.hallucinated_tags,
+            person_consistent=not args.person_drift,
+            status=args.status,
+            note=args.note or "",
+        )
+    except (FileNotFoundError, ValueError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     print(
         json.dumps(
             {"ok": True, "shot": args.shot, "entry": data["shots"][args.shot]},
@@ -710,6 +1004,60 @@ def main() -> int:
     p.add_argument("--note", default="")
     p.add_argument("--status", default="PASS", choices=["PASS", "FAIL"])
     p.set_defaults(func=cmd_size_review)
+
+    p = sub.add_parser("person-review")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True)
+    p.add_argument("--person-mismatch", action="store_true")
+    p.add_argument("--outfit-mismatch", action="store_true")
+    p.add_argument("--place-mismatch", action="store_true")
+    p.add_argument("--note", default="")
+    p.add_argument("--status", default="PASS", choices=["PASS", "FAIL"])
+    p.set_defaults(func=cmd_person_review)
+
+    p = sub.add_parser("inspect-stills")
+    p.add_argument("film")
+    p.set_defaults(func=cmd_inspect_stills)
+
+    p = sub.add_parser("product-review")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True)
+    p.add_argument("--features-fail", action="store_true")
+    p.add_argument("--wrong-variant", action="store_true")
+    p.add_argument("--hallucinated-tags", action="store_true")
+    p.add_argument("--note", default="")
+    p.add_argument("--status", default="PASS", choices=["PASS", "FAIL"])
+    p.set_defaults(func=cmd_product_review)
+
+    p = sub.add_parser("vlm-review-still")
+    p.add_argument("film")
+    p.add_argument("--shot", default=None)
+    p.add_argument("--provider", default="auto", choices=["auto", "codex", "openai"])
+    p.set_defaults(func=cmd_vlm_review_still)
+
+    p = sub.add_parser("vlm-review-video")
+    p.add_argument("film")
+    p.add_argument("--shot", default=None)
+    p.add_argument("--provider", default="auto", choices=["auto", "codex", "openai"])
+    p.set_defaults(func=cmd_vlm_review_video)
+
+    p = sub.add_parser("inspect-shots")
+    p.add_argument("film")
+    p.add_argument("--shot", default=None)
+    p.set_defaults(func=cmd_inspect_shots)
+
+    p = sub.add_parser("video-review")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True)
+    p.add_argument("--size-vs-spec", default="match", help="match|too_big|too_small|drift")
+    p.add_argument("--size-drift", action="store_true")
+    p.add_argument("--identity-fail", action="store_true")
+    p.add_argument("--baked-captions", action="store_true")
+    p.add_argument("--hallucinated-tags", action="store_true")
+    p.add_argument("--person-drift", action="store_true")
+    p.add_argument("--note", default="")
+    p.add_argument("--status", default="PASS", choices=["PASS", "FAIL"])
+    p.set_defaults(func=cmd_video_review)
 
     p = sub.add_parser("audit-batch")
     p.add_argument("--batch")

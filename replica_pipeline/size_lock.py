@@ -16,6 +16,7 @@ Hard conflict (user_spec + source-t0 swap):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -148,12 +149,21 @@ def _normalize_vs_source(raw: Any) -> str:
     return s
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def validate_shot_size_evidence(
     sid: str,
     entry: Any,
     *,
     source: str | None,
     data: dict,
+    film: Path | None = None,
 ) -> list[str]:
     """Per-shot checks. user_spec requires structured evidence, not a bare PASS string."""
     errs: list[str] = []
@@ -221,6 +231,14 @@ def validate_shot_size_evidence(
             f"SIZE-LOCK.json: {sid} mode=worn requires worn-scale-ref "
             "(film worn_scale_ref or refs_used)"
         )
+
+    recorded_hash = entry.get("still_sha256")
+    if recorded_hash and film is not None:
+        still = film / "first-frames" / "h3" / f"{sid}-first.jpg"
+        if still.is_file() and _file_sha256(still) != recorded_hash:
+            errs.append(
+                f"SIZE-LOCK.json: {sid} still_sha256 mismatch — still changed since size-review"
+            )
 
     return errs
 
@@ -299,7 +317,7 @@ def validate_size_lock_data(data: dict, film: Path, shots: list) -> list[str]:
         sid = s["id"]
         entry = shot_map.get(sid)
         errs.extend(
-            validate_shot_size_evidence(sid, entry, source=source, data=data)
+            validate_shot_size_evidence(sid, entry, source=source, data=data, film=film)
         )
     return errs
 
@@ -314,6 +332,7 @@ def apply_size_review(
     refs_used: list[str] | None = None,
     note: str = "",
     status: str = "PASS",
+    film: Path | None = None,
 ) -> dict:
     """Write structured evidence for one shot; returns updated SIZE-LOCK dict."""
     mode = mode.strip().lower()
@@ -339,6 +358,10 @@ def apply_size_review(
         "vs_source_occupancy": vs_src,
         "refs_used": list(refs_used or []),
     }
+    if film is not None:
+        still = Path(film) / "first-frames" / "h3" / f"{shot}-first.jpg"
+        if still.is_file():
+            entry["still_sha256"] = _file_sha256(still)
     if note:
         entry["note"] = note
     shots[shot] = entry

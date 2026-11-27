@@ -12,9 +12,9 @@ Fail-closed `/replica` 生产闸门：缺产物不能进下一步；H3 / 拼装 
 | `1_read_source` | `qa/source.json` + `cuts.json` + `presenter-place.md` |
 | `2_vo_adapt` | `VO-REMAKE.md` + `vo-density.json`（密度闸） |
 | `3_beat_plan` | `REBEAT-PLAN.json`（4–15s；禁无依据固定 7 镜） |
-| `4_stills` | 每镜 `first-frames/h3/Sxx-first.jpg` + `STILL-PRODUCT-LOCK.md` + `SIZE-LOCK.json` + `PERSON-LOCK.json` |
-| `5_h3` | 每镜 `shots/Sxx.mp4` + `H3-MEANING.md` + S01 后音色锁 |
-| `6_assemble` | captioned + BGM（**优先源配乐**）+ `assemble-check.json` |
+| `4_stills` | 每镜 `first-frames/h3/Sxx-first.jpg` + **`STILL-PRODUCT-LOCK.json`** + **`VLM-STILL-REVIEW.json`** + `SIZE-LOCK.json` + `PERSON-LOCK.json` + `still-contact-sheet.jpg`（+ 绑 sha256 的 `still-contact-sheet.json` 清单） |
+| `5_h3` | 每镜 `shots/Sxx.mp4` + `H3-MEANING.md` + **`H3-VISUAL-LOCK.json`（4 帧抽检）** + S01 后音色锁 |
+| `6_assemble` | 去杂音 + ASR 逐字对齐大字幕（56px@1152）+ BGM（**优先源配乐**）+ `assemble-check.json` |
 | `7_superres` | 须用户 `allow-superres` |
 
 ## 静帧主路径
@@ -29,6 +29,24 @@ Hypit 切源片 → 提每镜首帧 → AI **只换商品**（锁样式 + 大小
 
 禁止把源片大号旅行包的 bbox / 占背面积一起带进复刻静帧。  
 `SIZE-LOCK` 在 `source=user_spec` 时必须写结构化证据；裸字符串 `"PASS"` **不能**过 `4_stills` / `h3_submit`。
+
+### 进 H3 前的同框对比板（`inspect-stills`）
+
+`inspect-stills` 一次做三件事，全部 fail-closed：
+
+1. **几何检查** — 每镜首帧必须竖屏 ~9:16（宽高比 0.50–0.65）、≥480×800  
+2. **同框对比板** — `qa/still-contact-sheet.jpg`：前排放 `SIZE-DIAGRAM` / `WORN-SCALE-REF` / `CANON`，后接 `S01..Sxx` 横排，每格带文字标签  
+3. **绑 sha256 清单** — `qa/still-contact-sheet.json` 记录每格来源与 sha256；任一静帧重画后对比板**立即作废**（`Sxx stale`），必须重跑 `inspect-stills`
+
+尺寸/人物/商品三类锁都**禁裸 PASS**，全部是结构化对象并绑 `still_sha256`：
+
+| 锁 | 结构 | 绑定 |
+| --- | --- | --- |
+| `STILL-PRODUCT-LOCK.json` | `status` + `geometry_ok` / `features_intact` / `no_wrong_variant` / `no_hallucinated_tags` | `still_sha256` |
+| `VLM-STILL-REVIEW.json` | 独立 VLM 的 `verdict` + 4 个布尔（`size_match` / `identity_match` / `person_match` / `no_extra_tags`） | `reviewer` 须 `vlm:` 前缀 + `still_sha256` |
+| `PERSON-LOCK.json` | `same_person` / `same_outfit` / `same_place` | `still_sha256` |
+
+独立 VLM 复审（`vlm-review-still`）与出图分离：生成方不能自审自签。默认走本机 `codex exec`，也可用 `REPLICA_VLM_URL` / `REPLICA_VLM_KEY` / `REPLICA_VLM_MODEL` 指任意 OpenAI 兼容视觉端点。
 
 ## 全片硬锁
 
@@ -101,7 +119,14 @@ python -m replica_pipeline status FILM_DIR
 python -m replica_pipeline require FILM_DIR h3_submit --shot S01
 python -m replica_pipeline advance FILM_DIR
 python -m replica_pipeline extract-voice FILM_DIR
+python -m replica_pipeline inspect-stills FILM_DIR             # 首帧宽高比/分辨率检查 + 生成带标签同框对比板（重画静帧后必须重跑）
+python -m replica_pipeline product-review FILM_DIR --shot S01 # 结构化商品锁（禁裸 PASS，绑 sha256）
 python -m replica_pipeline size-review FILM_DIR --shot S01 --mode worn --vs-source smaller --refs front-with-size.jpg,worn-scale-ref.jpg
+python -m replica_pipeline person-review FILM_DIR --shot S02
+python -m replica_pipeline vlm-review-still FILM_DIR           # 独立 VLM 复审首帧，过审才能进 H3
+python -m replica_pipeline inspect-shots FILM_DIR              # 抽 4 帧联系表 + 扫描开头杂音/长停顿
+python -m replica_pipeline vlm-review-video FILM_DIR           # 独立 VLM 复审视频 4 帧联系表
+python -m replica_pipeline video-review FILM_DIR --shot S01    # 手动补录视频画面过检（绑 shot_sha256）
 python -m replica_pipeline allow-superres FILM_DIR
 python -m replica_pipeline audit-batch --batch .
 replica-pipeline status FILM_DIR   # console script

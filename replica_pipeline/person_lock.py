@@ -13,12 +13,21 @@ Degree: same remake person continuity — not source face-ID, not free casting.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
 from typing import Any
 
 REQUIRED_TRAITS = ("gender", "apparent_age", "hair", "outfit")
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def build_person_lock(
@@ -92,9 +101,62 @@ def validate_person_lock_data(data: dict, film: Path, shots: list) -> list[str]:
     shot_map = data.get("shots") or {}
     for s in shots:
         sid = s["id"]
-        st = shot_map.get(sid)
-        if isinstance(st, dict):
-            st = st.get("person") or st.get("status")
+        entry = shot_map.get(sid)
+        if not isinstance(entry, dict):
+            errs.append(
+                f"PERSON-LOCK.json: {sid} must be a structured object "
+                "(bare PASS forbidden; run person-review)"
+            )
+            continue
+        st = entry.get("person") or entry.get("status")
         if str(st).upper() != "PASS":
             errs.append(f"PERSON-LOCK.json: {sid} person not PASS")
+            continue
+        for flag in ("same_person", "same_outfit", "same_place"):
+            if entry.get(flag) is not True:
+                errs.append(f"PERSON-LOCK.json: {sid} {flag} must be true")
+        rec_hash = entry.get("still_sha256")
+        still = film / "first-frames" / "h3" / f"{sid}-first.jpg"
+        if not rec_hash:
+            errs.append(f"PERSON-LOCK.json: {sid} missing still_sha256")
+        elif still.is_file() and _file_sha256(still) != rec_hash:
+            errs.append(
+                f"PERSON-LOCK.json: {sid} still_sha256 mismatch — still changed since person-review"
+            )
     return errs
+
+
+def apply_person_review(
+    data: dict[str, Any],
+    shot: str,
+    *,
+    same_person: bool = True,
+    same_outfit: bool = True,
+    same_place: bool = True,
+    note: str = "",
+    status: str = "PASS",
+    film: Path | None = None,
+) -> dict[str, Any]:
+    """Write structured presenter-continuity review for one shot."""
+    final_status = status.upper()
+    if final_status == "PASS" and not (same_person and same_outfit and same_place):
+        raise ValueError("Cannot mark PASS when same_person/same_outfit/same_place is false")
+
+    shots = dict(data.get("shots") or {})
+    entry: dict[str, Any] = {
+        "status": final_status,
+        "same_person": bool(same_person),
+        "same_outfit": bool(same_outfit),
+        "same_place": bool(same_place),
+    }
+    if film is not None:
+        still = Path(film) / "first-frames" / "h3" / f"{shot}-first.jpg"
+        if still.is_file():
+            entry["still_sha256"] = _file_sha256(still)
+    if note:
+        entry["note"] = note
+    shots[shot] = entry
+    out = dict(data)
+    out["shots"] = shots
+    out["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return out
