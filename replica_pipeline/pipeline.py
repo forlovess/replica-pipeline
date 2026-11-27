@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import subprocess
 import re
 import sys
 import time
@@ -41,6 +43,81 @@ except ImportError:
 
 PIPELINE_NAME = "qa/PIPELINE.json"
 VERSION = 1
+
+try:
+    from .script_lint import compile_remake_text, compile_script_contract, read_strict_json, speech_chars
+    from .video_qa import file_sha256
+except ImportError:
+    from script_lint import compile_remake_text, compile_script_contract, read_strict_json, speech_chars
+    from video_qa import file_sha256
+
+
+def _source_inputs(film: Path) -> dict:
+    spec_path = film / "qa/source.json"
+    spec = read_strict_json(spec_path)
+    duration = spec.get("duration")
+    if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+        raise ValueError("source.json: duration must be positive")
+    paths = [spec_path, film / "qa/presenter-place.md"]
+    for key in ("path", "cuts_path", "asr_path", "overview_path"):
+        value = spec.get(key) or ("qa/cuts.json" if key == "cuts_path" else None)
+        if not value:
+            if key == "path":
+                raise ValueError("source.json: missing source path")
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"source.json: {key} must be a path string")
+        path = film / value
+        if not path.is_file():
+            raise ValueError(f"source.json: referenced {key} is missing: {path}")
+        paths.append(path)
+    stem = spec.get("stem_split") or {}
+    if not isinstance(stem, dict):
+        raise ValueError("source.json: stem_split must be an object")
+    for key in ("path", "bgm", "vocals"):
+        value = stem.get(key)
+        if value:
+            if not isinstance(value, str) or not (film / value).is_file():
+                raise ValueError(f"source.json: referenced stem_split.{key} is missing")
+            paths.append(film / value)
+    cuts_path = film / (spec.get("cuts_path") or "qa/cuts.json")
+    cuts = read_strict_json(cuts_path).get("cuts")
+    if not isinstance(cuts, list):
+        raise ValueError("cuts.json: expected cuts array")
+    previous = -1
+    for cut in cuts:
+        point = cut.get("t", cut.get("time")) if isinstance(cut, dict) else cut
+        if type(point) not in (int, float) or not previous < point <= duration or point < 0:
+            raise ValueError("cuts.json: cut times must be strictly ordered and in range")
+        previous = point
+    if spec.get("cuts_count", len(cuts)) != len(cuts):
+        raise ValueError("source.json: cuts_count disagrees with cuts.json")
+    asr = film / (spec.get("asr_path") or "qa/source-asr.json")
+    if asr.is_file():
+        paths.append(asr)
+    recognized = _source_transcript(asr)
+    if not recognized and spec.get("silent_source") is not True:
+        raise ValueError("source-asr.json missing or empty; explicitly set silent_source=true for silent footage")
+    return {str(path.relative_to(film)) if path.is_relative_to(film) else str(path): file_sha256(path)
+            for path in sorted(set(paths))}
+
+
+def _source_transcript(path: Path) -> str:
+    if not path.is_file() or not path.stat().st_size:
+        return ""
+    try:
+        from .asr_verify import transcript_text
+    except ImportError:
+        from asr_verify import transcript_text
+    return speech_chars(transcript_text(read_strict_json(path)))
+
+
+def validate_source(film: Path) -> list[str]:
+    try:
+        _source_inputs(Path(film))
+    except (OSError, ValueError, TypeError) as exc:
+        return [str(exc)]
+    return []
 
 
 def now() -> str:
@@ -122,10 +199,17 @@ def artifacts_present(film: Path, stage: str) -> tuple[bool, list[str]]:
         allow = film / "qa/superres-allow.json"
         if allow.is_file():
             try:
-                if not json.loads(allow.read_text()).get("allow"):
+                evidence = read_strict_json(allow)
+                if evidence.get("allow") is not True or evidence.get("by") != "user":
                     missing.append("qa/superres-allow.json:allow!=true")
             except Exception:
                 missing.append("qa/superres-allow.json:invalid")
+        if (film / "qa/SUPERRES.json").is_file():
+            try:
+                from .superres import validate_superres_data
+            except ImportError:
+                from superres import validate_superres_data
+            missing.extend(validate_superres_data(film))
     return (len(missing) == 0, missing)
 
 
@@ -164,11 +248,26 @@ def validate_vo_density(film: Path) -> list[str]:
         return []
     errs = []
     try:
-        d = json.loads(p.read_text())
+        d = read_strict_json(p)
     except Exception as e:
         return [f"vo-density.json: {e}"]
     src = d.get("source_chars") or 0
     rem = d.get("remake_chars") or 0
+    source = film / "qa/source.json"
+    script = film / "qa/VO-REMAKE.md"
+    if source.is_file() and source.stat().st_size and script.is_file() and script.stat().st_size:
+        try:
+            spec = read_strict_json(source)
+            actual_src = len(_source_transcript(film / (spec.get("asr_path") or "qa/source-asr.json")))
+            actual_rem = len(speech_chars(compile_remake_text(script.read_text())))
+            expected = actual_rem / actual_src if actual_src else 0
+            ratio = d.get("ratio")
+            if src != actual_src or rem != actual_rem or type(ratio) not in (int, float) or abs(ratio - expected) > 0.005:
+                errs.append(f"vo-density.json: expected source_chars={actual_src}, remake_chars={actual_rem}, ratio={expected:.4f}")
+        except (OSError, ValueError, TypeError) as exc:
+            return [f"vo-density.json: {exc}"]
+    if type(src) not in (int, float) or type(rem) not in (int, float):
+        return ["vo-density.json: character counts must be numeric"]
     if src <= 0:
         return errs
     ratio = rem / src if src else 0
@@ -199,7 +298,7 @@ def validate_size_lock(film: Path, shots: list) -> list[str]:
         from .size_lock import validate_size_lock_data
     except ImportError:
         from size_lock import validate_size_lock_data
-    return validate_size_lock_data(data, film, shots)
+    return validate_size_lock_data(data, film, shots, require_still_hash=True)
 
 
 def validate_stills(film: Path) -> list[str]:
@@ -297,16 +396,23 @@ def validate_h3(film: Path) -> list[str]:
         return ["qa/REBEAT-PLAN.json required"]
     shots = json.loads(plan.read_text()).get("shots") or []
     meaning = film / "qa/H3-MEANING.md"
+    structured = (film / "qa/H3-MEANING.json").is_file()
     meaning_txt = meaning.read_text() if meaning.is_file() else ""
     for s in shots:
         sid = s["id"]
         vid = film / "shots" / f"{sid}.mp4"
         if not vid.is_file():
             errs.append(f"missing shots/{sid}.mp4")
-        if meaning.is_file() and not re.search(rf"{sid}[^\n]*PASS", meaning_txt):
+        if not structured and meaning.is_file() and not re.search(rf"\b{sid}\b[^\n]*\bPASS\b", meaning_txt):
             errs.append(f"{sid}: meaning PASS missing in qa/H3-MEANING.md")
-    if not meaning.is_file():
-        errs.append("qa/H3-MEANING.md required")
+    if structured:
+        try:
+            from .asr_verify import validate_meaning_lock_data
+        except ImportError:
+            from asr_verify import validate_meaning_lock_data
+        errs.extend(validate_meaning_lock_data(film, shots))
+    elif not meaning.is_file():
+        errs.append("qa/H3-MEANING.json required (run asr-verify)")
 
     # Post-H3 visual QA (size stability, identity, no baked captions/tags, person continuity)
     vlock_p = film / "qa/H3-VISUAL-LOCK.json"
@@ -323,49 +429,32 @@ def validate_h3(film: Path) -> list[str]:
         except Exception as e:
             errs.append(f"H3-VISUAL-LOCK.json: {e}")
 
-    # Film-level voice lock required once more than one shot exists and S01 is on disk
-    if len(shots) >= 2:
-        s01 = shots[0]["id"]
-        s01_vid = film / "shots" / f"{s01}.mp4"
-        if s01_vid.is_file():
-            vjson = film / "qa/VOICE-LOCK.json"
-            vwav = film / "qa/voice-lock/S01-voice.wav"
-            if not vwav.is_file():
-                errs.append("qa/voice-lock/S01-voice.wav required (extract from S01)")
-            if not vjson.is_file():
-                errs.append("qa/VOICE-LOCK.json required")
-            else:
-                try:
-                    vmeta = json.loads(vjson.read_text())
-                    src_sha = vmeta.get("source_sha256")
-                    if src_sha:
-                        try:
-                            from .video_qa import file_sha256
-                        except ImportError:
-                            from video_qa import file_sha256
-                        if file_sha256(s01_vid) != src_sha:
-                            errs.append(
-                                f"VOICE-LOCK.json: {s01}.mp4 changed since extract-voice — rerun extract-voice --force"
-                            )
-                except Exception as e:
-                    errs.append(f"VOICE-LOCK.json: {e}")
-            # later shots must have been submitted with voice ref recorded
-            for s in shots[1:]:
-                sid = s["id"]
-                task = film / "tasks" / f"{sid}.task.json"
-                if task.is_file():
-                    try:
-                        st = json.loads(task.read_text())
-                    except Exception:
-                        continue
-                    if st.get("state") == "DOWNLOADED" and not st.get("voice_ref"):
-                        errs.append(
-                            f"{sid}: DOWNLOADED without voice_ref — must ref2v+S01 voice"
-                        )
-                    if st.get("mode") == "i2v" and st.get("state") == "DOWNLOADED":
-                        errs.append(
-                            f"{sid}: mode=i2v after S01 — must use ref2v with voice lock"
-                        )
+    try:
+        from .h3_submit import _validate_task_inputs
+        from .voice_lock import voice_requirements
+        from .video_qa import CONTACT_DIR_NAME
+    except ImportError:
+        from h3_submit import _validate_task_inputs
+        from voice_lock import voice_requirements
+        from video_qa import CONTACT_DIR_NAME
+    if structured:
+        meaning_entries = read_strict_json(film / "qa/H3-MEANING.json").get("shots") or {}
+        for row in shots:
+            sid = row["id"]
+            try:
+                role, boot, bank = voice_requirements(film, sid)
+                vid = film / "shots" / f"{sid}.mp4"
+                task = read_strict_json(film / "tasks" / f"{sid}.task.json")
+                sheet = film / CONTACT_DIR_NAME / f"{sid}.jpg"
+                _validate_task_inputs(film, sid, task)
+                if (task.get("state") != "DOWNLOADED" or task.get("acceptance") != "PASS" or task.get("sha256") != file_sha256(vid)
+                        or task.get("role") != role or task.get("contact_sheet_sha256") != file_sha256(sheet)
+                        or not task.get("acceptance_asr_sha256") or task["acceptance_asr_sha256"] != meaning_entries.get(sid, {}).get("asr_sha256")):
+                    raise ValueError("missing or stale acceptance; run accept-shot")
+                if role and (bank is None or (sid != boot and (task.get("mode") != "ref2v" or not task.get("voice_ref")))):
+                    raise ValueError(f"{role} voice lock missing or shot did not use its voice bank")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                errs.append(f"{sid}: {exc}")
     return errs
 
 
@@ -428,180 +517,95 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_stage(film: Path, stage: str, *, record: bool = False, state: dict | None = None) -> list[str]:
+    try:
+        errors = artifacts_present(film, stage)[1]
+        if errors:
+            return errors
+        snapshot = {rel: file_sha256(film / rel) for rel in REQUIRED[stage]}
+        if stage == "1_read_source":
+            snapshot.update(_source_inputs(film))
+        elif stage == "3_beat_plan":
+            current = compile_script_contract(film, write=record)
+            if not record:
+                locked = read_strict_json(film / "qa/SCRIPT-LOCK.json")
+                if locked["shots"] != current["shots"] or locked["inputs"] != current["inputs"]:
+                    return ["SCRIPT-LOCK.json stale; re-pass 3_beat_plan"]
+            snapshot["qa/SCRIPT-LOCK.json"] = file_sha256(film / "qa/SCRIPT-LOCK.json")
+        elif stage == "5_h3" and not (film / "qa/H3-MEANING.json").is_file():
+            return ["legacy meaning report is not hash-bound; run asr-verify for every shot"]
+        elif stage == "5_h3":
+            snapshot["qa/H3-MEANING.json"] = file_sha256(film / "qa/H3-MEANING.json")
+        elif stage == "6_assemble":
+            try:
+                from .assemble_tools import validate_assemble_data
+            except ImportError:
+                from assemble_tools import validate_assemble_data
+            errors = validate_assemble_data(film, strict=True)
+            if errors:
+                return errors
+        if record and state is not None:
+            state["inputs"] = snapshot
+        elif not record and (state or {}).get("inputs") != snapshot:
+            return [f"stage evidence changed or not locked; re-pass {stage}"]
+        return []
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        return [str(exc)]
+
+
 def cmd_require(args: argparse.Namespace) -> int:
-    """Hard gate for scripts. Exit 2 if locked."""
-    film = Path(args.film)
+    film = Path(args.film).resolve()
     action = args.action
     if action not in ACTION_REQUIRES:
-        print(f"unknown action {action}", file=sys.stderr)
         return 3
     data = load(film)
-    refresh_locks(data)
-    save(film, data)
-
-    if data.get("void", {}).get("sparse7_template") and action == "h3_submit":
-        # Allow H3 only after rebeat stages passed; void flag is informational once rebeat done
-        pass
-
     need = ACTION_REQUIRES[action]
-    # all stages up to and including need must pass
-    for s in STAGE_ORDER:
-        if data["stages"][s]["status"] != "pass":
-            print(
-                f"GATE FAIL: action={action} blocked; stage {s} is {data['stages'][s]['status']} "
-                f"(requires through {need})",
-                file=sys.stderr,
-            )
-            return 2
-        if s == need:
-            break
-
-    if action == "h3_submit" and not data["locks"].get("h3_submit"):
-        print("GATE FAIL: locks.h3_submit=false", file=sys.stderr)
-        return 2
-    if action == "assemble":
-        if not data["locks"].get("assemble"):
-            print("GATE FAIL: locks.assemble=false", file=sys.stderr)
-            return 2
-        ok_h3, bad_h3 = artifacts_present(film, "5_h3")
-        if not ok_h3:
-            print(
-                "GATE FAIL: 5_h3 artifacts/locks invalid:\n  - " + "\n  - ".join(bad_h3),
-                file=sys.stderr,
-            )
+    for stage in STAGE_ORDER[:STAGE_ORDER.index(need) + 1]:
+        errors = ([f"{stage} is not pass"] if data["stages"][stage]["status"] != "pass"
+                  else _validate_stage(film, stage, state=data["stages"][stage]))
+        if errors:
+            print(f"GATE FAIL: {stage}: " + "; ".join(errors), file=sys.stderr)
             return 2
     if action == "superres":
-        if not data["locks"].get("superres_user_allow"):
-            print("GATE FAIL: superres not user-allowed", file=sys.stderr)
+        try:
+            allowed = read_strict_json(film / "qa/superres-allow.json")
+            if allowed.get("allow") is not True or allowed.get("by") != "user":
+                raise ValueError("superres not user-allowed")
+        except ValueError as exc:
+            print(f"GATE FAIL: {exc}", file=sys.stderr)
             return 2
-        if data["stages"]["6_assemble"]["status"] != "pass":
-            print("GATE FAIL: assemble not pass", file=sys.stderr)
+    shot = getattr(args, "shot", None)
+    if shot and action != "h3_submit":
+        ids = {row["id"] for row in read_strict_json(film / "qa/REBEAT-PLAN.json")["shots"]}
+        if shot not in ids:
+            print(f"GATE FAIL: {shot} not in REBEAT-PLAN", file=sys.stderr)
             return 2
-        ok_asm, bad_asm = artifacts_present(film, "6_assemble")
-        if not ok_asm:
-            print(
-                "GATE FAIL: 6_assemble artifacts/locks invalid:\n  - " + "\n  - ".join(bad_asm),
-                file=sys.stderr,
-            )
+    if action == "h3_submit" and shot:
+        try:
+            from .asr_verify import validate_meaning_lock_data
+            from .voice_lock import voice_requirements
+        except ImportError:
+            from asr_verify import validate_meaning_lock_data
+            from voice_lock import voice_requirements
+        try:
+            role, bootstrap, bank = voice_requirements(film, shot)
+            if role and bootstrap != shot:
+                receipt = read_strict_json(film / "tasks" / f"{bootstrap}.task.json")
+                if (bank is None or receipt.get("state") != "DOWNLOADED" or receipt.get("acceptance") != "PASS"
+                        or receipt.get("sha256") != file_sha256(film / "shots" / f"{bootstrap}.mp4")
+                        or validate_meaning_lock_data(film, [bootstrap])):
+                    raise ValueError(f"{bootstrap}: accept {role} bootstrap shot before submitting {shot}")
+            if not (film / "prompts" / f"{shot}.txt").is_file():
+                raise ValueError(f"missing prompts/{shot}.txt")
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"GATE FAIL: {exc}", file=sys.stderr)
             return 2
-
-    # Per-shot still for h3_submit
-    if action == "h3_submit" and args.shot:
-        shot = args.shot
-        still = film / "first-frames" / "h3" / f"{shot}-first.jpg"
-        if not still.is_file():
-            print(f"GATE FAIL: missing {still}", file=sys.stderr)
-            return 2
-        plan = film / "qa/REBEAT-PLAN.json"
-        first_id = "S01"
-        if plan.is_file():
-            shots = json.loads(plan.read_text()).get("shots") or []
-            ids = {s["id"] for s in shots}
-            if shot not in ids:
-                print(f"GATE FAIL: {shot} not in REBEAT-PLAN.json", file=sys.stderr)
-                return 2
-            if shots:
-                first_id = shots[0]["id"]
-        size_lock = film / "qa/SIZE-LOCK.json"
-        if not size_lock.is_file():
-            print("GATE FAIL: missing qa/SIZE-LOCK.json (film-level product size)", file=sys.stderr)
-            return 2
-        # Re-validate structured size evidence (user_spec must not paper-PASS)
-        if plan.is_file():
-            plan_shots = json.loads(plan.read_text()).get("shots") or []
-            size_errs = validate_size_lock(film, plan_shots)
-            if size_errs:
-                print(
-                    "GATE FAIL: SIZE-LOCK evidence:\n  - "
-                    + "\n  - ".join(size_errs),
-                    file=sys.stderr,
-                )
-                return 2
-        person_lock = film / "qa/PERSON-LOCK.json"
-        if not person_lock.is_file():
-            print(
-                "GATE FAIL: missing qa/PERSON-LOCK.json (film-level presenter continuity)",
-                file=sys.stderr,
-            )
-            return 2
-        if plan.is_file():
-            plan_shots = json.loads(plan.read_text()).get("shots") or []
-            person_errs = validate_person_lock(film, plan_shots)
-            if person_errs:
-                print(
-                    "GATE FAIL: PERSON-LOCK evidence:\n  - "
-                    + "\n  - ".join(person_errs),
-                    file=sys.stderr,
-                )
-                return 2
-            try:
-                from .still_qa import validate_product_lock_data, validate_still_sheet
-                from .vlm_review import VLM_STILL_LOCK_NAME, validate_vlm_still_review_data
-            except ImportError:
-                from still_qa import validate_product_lock_data, validate_still_sheet
-                from vlm_review import VLM_STILL_LOCK_NAME, validate_vlm_still_review_data
-            prod_p = film / "qa/STILL-PRODUCT-LOCK.json"
-            vlm_p = film / VLM_STILL_LOCK_NAME
-            extra_errs = validate_still_sheet(film, plan_shots)
-            if not prod_p.is_file():
-                extra_errs.append("missing qa/STILL-PRODUCT-LOCK.json")
-            else:
-                extra_errs.extend(validate_product_lock_data(json.loads(prod_p.read_text()), film, plan_shots))
-            if not vlm_p.is_file():
-                extra_errs.append(f"missing {VLM_STILL_LOCK_NAME} (run vlm-review-still)")
-            else:
-                extra_errs.extend(validate_vlm_still_review_data(json.loads(vlm_p.read_text()), film, plan_shots))
-            if extra_errs:
-                print(
-                    "GATE FAIL: PRE-H3 STILL EVIDENCE:\n  - "
-                    + "\n  - ".join(extra_errs),
-                    file=sys.stderr,
-                )
-                return 2
-        # S02+ require S01 voice bank matching current S01 video
-        if shot != first_id:
-            vwav = film / "qa/voice-lock/S01-voice.wav"
-            vjson = film / "qa/VOICE-LOCK.json"
-            if not vwav.is_file():
-                print(
-                    f"GATE FAIL: missing {vwav} — run extract-voice after {first_id} downloads",
-                    file=sys.stderr,
-                )
-                return 2
-            if not vjson.is_file():
-                print(
-                    f"GATE FAIL: missing {vjson} — run extract-voice after {first_id} downloads",
-                    file=sys.stderr,
-                )
-                return 2
-            try:
-                vmeta = json.loads(vjson.read_text())
-                s01_vid = film / "shots" / f"{first_id}.mp4"
-                src_sha = vmeta.get("source_sha256")
-                if not src_sha:
-                    print("GATE FAIL: VOICE-LOCK.json missing source_sha256", file=sys.stderr)
-                    return 2
-                if s01_vid.is_file():
-                    try:
-                        from .video_qa import file_sha256
-                    except ImportError:
-                        from video_qa import file_sha256
-                    if file_sha256(s01_vid) != src_sha:
-                        print(
-                            f"GATE FAIL: VOICE-LOCK stale ({first_id}.mp4 changed) — run extract-voice --force",
-                            file=sys.stderr,
-                        )
-                        return 2
-            except Exception as e:
-                print(f"GATE FAIL: invalid VOICE-LOCK.json: {e}", file=sys.stderr)
-                return 2
-
     print(json.dumps({"ok": True, "action": action, "film": film.name}, ensure_ascii=False))
     return 0
 
 
 def cmd_set(args: argparse.Namespace) -> int:
-    film = Path(args.film)
+    film = Path(args.film).resolve()
     stage = args.stage
     status = args.status
     if stage not in STAGE_ORDER:
@@ -611,26 +615,31 @@ def cmd_set(args: argparse.Namespace) -> int:
         print("bad status", file=sys.stderr)
         return 3
     data = load(film)
+    evidence = {}
+    old_evidence = data["stages"][stage].get("inputs")
     if status == "pass":
-        ok, missing = artifacts_present(film, stage)
-        if not ok:
-            print("cannot PASS; missing:", ", ".join(missing), file=sys.stderr)
-            return 2
-        # prior stages must pass
-        for s in STAGE_ORDER:
-            if s == stage:
-                break
-            if data["stages"][s]["status"] != "pass":
-                print(f"cannot PASS {stage}; prior {s} not pass", file=sys.stderr)
+        for prior in STAGE_ORDER[:STAGE_ORDER.index(stage) + 1]:
+            if prior != stage and data["stages"][prior]["status"] != "pass":
+                print(f"cannot PASS {stage}; prior {prior} not pass", file=sys.stderr)
+                return 2
+            missing = _validate_stage(film, prior, record=prior == stage,
+                                      state=evidence if prior == stage else data["stages"][prior])
+            if missing:
+                print(f"cannot PASS {stage}; {prior}: " + "; ".join(missing), file=sys.stderr)
                 return 2
     data["stages"][stage] = {
         "status": status,
         "note": args.note or data["stages"][stage].get("note", ""),
         "updated": now(),
+        **evidence,
     }
     # bump current
     if status == "pass":
         idx = STAGE_ORDER.index(stage)
+        if old_evidence != evidence.get("inputs"):
+            for later in STAGE_ORDER[idx + 1:]:
+                if data["stages"][later]["status"] != "pending":
+                    data["stages"][later] = {"status": "pending", "note": f"revalidate after {stage} changed", "updated": now()}
         if idx + 1 < len(STAGE_ORDER):
             data["current"] = STAGE_ORDER[idx + 1]
         else:
@@ -647,10 +656,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
     film = Path(args.film)
     data = load(film)
     stage = data["current"]
-    ok, missing = artifacts_present(film, stage)
-    if not ok:
-        print(f"advance blocked at {stage}; missing: {', '.join(missing)}", file=sys.stderr)
-        return 2
     args.stage = stage
     args.status = "pass"
     args.note = args.note or "advance"
@@ -704,12 +709,23 @@ def cmd_allow_superres(args: argparse.Namespace) -> int:
 
 def cmd_extract_voice(args: argparse.Namespace) -> int:
     try:
-        from .voice_lock import ensure_voice_lock
+        from .voice_lock import ensure_voice_lock, first_shot_id, shot_roles
+        from .asr_verify import validate_meaning_lock_data
     except ImportError:
-        from voice_lock import ensure_voice_lock
+        from voice_lock import ensure_voice_lock, first_shot_id, shot_roles
+        from asr_verify import validate_meaning_lock_data
 
     film = Path(args.film)
-    meta = ensure_voice_lock(film, force=bool(args.force))
+    role = getattr(args, "role", None)
+    shot = getattr(args, "shot", None) or (next((sid for sid, value in shot_roles(film).items() if value == role), None) if role else first_shot_id(film))
+    if shot not in shot_roles(film):
+        raise ValueError("role/shot is not in the plan")
+    task = read_strict_json(film / "tasks" / f"{shot}.task.json")
+    if (task.get("acceptance") != "PASS" or task.get("state") != "DOWNLOADED"
+            or task.get("sha256") != file_sha256(film / "shots" / f"{shot}.mp4")
+            or validate_meaning_lock_data(film, [shot])):
+        raise ValueError(f"{shot}: complete accept-shot before extracting a voice bank")
+    meta = ensure_voice_lock(film, force=bool(args.force), role=role, shot=shot)
     print(json.dumps({"ok": True, **meta}, ensure_ascii=False))
     return 0
 
@@ -1106,6 +1122,8 @@ def cmd_assemble(args: argparse.Namespace) -> int:
             height=int(args.height),
             skip_gate=bool(args.skip_gate),
             allow_uncaptioned=bool(args.allow_uncaptioned),
+            matrix_seed=getattr(args, "matrix_seed", None),
+            differentiate=getattr(args, "differentiate", False),
         )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(str(e), file=sys.stderr)
@@ -1151,6 +1169,50 @@ def cmd_export_hypit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    return cmd_require(argparse.Namespace(film=args.film, action={"h3": "h3_submit"}.get(args.before, args.before), shot=args.shot))
+
+
+def cmd_asr_verify(args: argparse.Namespace) -> int:
+    try:
+        from .asr_verify import verify_shot_meaning
+    except ImportError:
+        from asr_verify import verify_shot_meaning
+    result = verify_shot_meaning(Path(args.film), args.shot, asr_path=args.asr_path, language=args.language)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["verdict"] == "PASS" else 2
+
+
+def cmd_accept_shot(args: argparse.Namespace) -> int:
+    try:
+        from .h3_submit import accept_downloaded_shot
+    except ImportError:
+        from h3_submit import accept_downloaded_shot
+    result = accept_downloaded_shot(Path(args.film), args.shot, vlm_provider=args.vlm_provider, asr_path=args.asr_path)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_audit_matrix(args: argparse.Namespace) -> int:
+    try:
+        from .matrix_audit import audit_matrix
+    except ImportError:
+        from matrix_audit import audit_matrix
+    result = audit_matrix(args.batch, out_dir=args.out, policy_path=args.policy)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["ok"] else 2
+
+
+def cmd_superres(args: argparse.Namespace) -> int:
+    try:
+        from .superres import run_superres
+    except ImportError:
+        from superres import run_superres
+    result = run_superres(Path(args.film), base_url=args.base_url, resume=args.resume)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Replica fail-closed pipeline")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1170,6 +1232,38 @@ def main() -> int:
     p.add_argument("action", choices=list(ACTION_REQUIRES))
     p.add_argument("--shot")
     p.set_defaults(func=cmd_require)
+
+    p = sub.add_parser("preflight")
+    p.add_argument("film")
+    p.add_argument("--before", required=True, choices=("stills", "h3", "assemble"))
+    p.add_argument("--shot")
+    p.set_defaults(func=cmd_preflight)
+
+    p = sub.add_parser("asr-verify")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True)
+    p.add_argument("--asr-path")
+    p.add_argument("--language", default="zh")
+    p.set_defaults(func=cmd_asr_verify)
+
+    p = sub.add_parser("accept-shot")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True)
+    p.add_argument("--asr-path")
+    p.add_argument("--vlm-provider", choices=("none", "auto", "codex", "openai"), default="none")
+    p.set_defaults(func=cmd_accept_shot)
+
+    p = sub.add_parser("audit-matrix")
+    p.add_argument("--batch", action="append", required=True)
+    p.add_argument("--policy")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_audit_matrix)
+
+    p = sub.add_parser("superres")
+    p.add_argument("film")
+    p.add_argument("--base-url")
+    p.add_argument("--resume", action="store_true")
+    p.set_defaults(func=cmd_superres)
 
     p = sub.add_parser("set")
     p.add_argument("film")
@@ -1199,6 +1293,8 @@ def main() -> int:
 
     p = sub.add_parser("extract-voice")
     p.add_argument("film")
+    p.add_argument("--role")
+    p.add_argument("--shot")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_extract_voice)
 
@@ -1352,6 +1448,8 @@ def main() -> int:
     p.add_argument("--height", default="2048")
     p.add_argument("--skip-gate", action="store_true")
     p.add_argument("--allow-uncaptioned", action="store_true")
+    p.add_argument("--matrix-seed")
+    p.add_argument("--differentiate", action="store_true")
     p.set_defaults(func=cmd_assemble)
 
     p = sub.add_parser("review-html")
@@ -1369,7 +1467,11 @@ def main() -> int:
     p.set_defaults(func=cmd_export_hypit)
 
     args = ap.parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"{args.cmd}: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

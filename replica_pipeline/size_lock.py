@@ -164,6 +164,7 @@ def validate_shot_size_evidence(
     source: str | None,
     data: dict,
     film: Path | None = None,
+    require_still_hash: bool = False,
 ) -> list[str]:
     """Per-shot checks. user_spec requires structured evidence, not a bare PASS string."""
     errs: list[str] = []
@@ -248,7 +249,7 @@ def validate_shot_size_evidence(
         )
 
     recorded_hash = entry.get("still_sha256")
-    if recorded_hash and film is not None:
+    if film is not None and (recorded_hash or require_still_hash):
         still = film / "first-frames" / "h3" / f"{sid}-first.jpg"
         if still.is_file() and _file_sha256(still) != recorded_hash:
             errs.append(
@@ -258,7 +259,7 @@ def validate_shot_size_evidence(
     return errs
 
 
-def validate_size_lock_data(data: dict, film: Path, shots: list) -> list[str]:
+def validate_size_lock_data(data: dict, film: Path, shots: list, *, require_still_hash: bool = False) -> list[str]:
     errs: list[str] = []
     source = data.get("source")
     if source not in VALID_SOURCES:
@@ -332,7 +333,7 @@ def validate_size_lock_data(data: dict, film: Path, shots: list) -> list[str]:
         sid = s["id"]
         entry = shot_map.get(sid)
         errs.extend(
-            validate_shot_size_evidence(sid, entry, source=source, data=data, film=film)
+            validate_shot_size_evidence(sid, entry, source=source, data=data, film=film, require_still_hash=require_still_hash)
         )
     return errs
 

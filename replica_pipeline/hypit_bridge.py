@@ -11,22 +11,23 @@ Connects replica-pipeline to installed Hypit tools:
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
-from xml.sax.saxutils import escape as xml_escape
+from xml.sax.saxutils import escape as xml_escape, quoteattr
 
 try:
     from .audio_stem import extract_source_stems
-    from .script_lint import DUAL_TEXT_RE, extract_dialogue_segments, project_dual_text
+    from .assemble_tools import build_assembly_timeline
+    from .script_lint import DIALOGUE_RE, DUAL_TEXT_RE, ROLE_RE, TAG_PREFIX_RE, speech_chars
     from .video_qa import ffprobe_duration
 except ImportError:
     from audio_stem import extract_source_stems
-    from script_lint import DUAL_TEXT_RE, extract_dialogue_segments, project_dual_text
+    from assemble_tools import build_assembly_timeline
+    from script_lint import DIALOGUE_RE, DUAL_TEXT_RE, ROLE_RE, TAG_PREFIX_RE, speech_chars
     from video_qa import ffprobe_duration
 
 
@@ -41,7 +42,7 @@ def _run_json(cmd: list[str], *, timeout: int = 120) -> Any:
 
 def probe_source_video(source: Path, *, use_hypit: bool = False) -> dict[str, Any]:
     """Probe duration, width, height, and fps via Hypit CLI or ffprobe."""
-    source = Path(source)
+    source = Path(source).resolve()
     if not source.is_file():
         raise FileNotFoundError(f"missing source video: {source}")
     if use_hypit and has_hypit():
@@ -241,8 +242,12 @@ def prepare_source(
         )
     if asr_path.is_file():
         try:
+            try:
+                from .asr_verify import transcript_text
+            except ImportError:
+                from asr_verify import transcript_text
             body = json.loads(asr_path.read_text())
-            asr_chars = sum(len(w.get("word") or w.get("text") or "") for s in body.get("segments") or [] for w in s.get("words") or [])
+            asr_chars = len(speech_chars(transcript_text(body)))
         except Exception:
             asr_chars = 0
 
@@ -287,19 +292,32 @@ def _slug(name: str) -> str:
 
 def _shot_script_body(film: Path, shot: dict[str, Any]) -> str:
     sid = shot["id"]
+    if shot.get("silent") or shot.get("audio_owner", sid) != sid:
+        return ""
     pfile = film / "prompts" / f"{sid}.txt"
-    if pfile.is_file():
-        segs = extract_dialogue_segments(pfile.read_text())
-        if segs:
-            return " || ".join(xml_escape(s) for s in segs)
-    spoken = str(shot.get("spoken") or shot.get("vo") or "").strip()
-    if spoken:
-        return xml_escape(spoken)
-    return ""
+    prompt = ROLE_RE.sub("", pfile.read_text()) if pfile.is_file() else ""
+    plan = ROLE_RE.sub("", shot.get("spoken") or shot.get("vo") or "")
+    raw = plan if DUAL_TEXT_RE.search(plan) else (prompt if DIALOGUE_RE.search(prompt) else plan)
+    segments = DIALOGUE_RE.findall(raw) or [raw]
+
+    def escape_segment(segment):
+        segment = TAG_PREFIX_RE.sub("", segment).strip()
+        parts, cursor = [], 0
+        for match in DUAL_TEXT_RE.finditer(segment):
+            parts.extend((xml_escape(segment[cursor:match.start()]), f"<{xml_escape(match[1])}|{xml_escape(match[2])}>"))
+            cursor = match.end()
+        return "".join(parts) + xml_escape(segment[cursor:])
+
+    return " || ".join(part for segment in segments if (part := escape_segment(segment)))
 
 
-def _rel_pos(target: Path, base: Path) -> str:
-    return "./" + Path(os.path.relpath(target.resolve(), base.resolve())).as_posix()
+def _project_asset(source: Path, project: Path, name: str) -> str:
+    asset = project / "assets" / name
+    asset.parent.mkdir(parents=True, exist_ok=True)
+    temporary = asset.with_suffix(".part")
+    shutil.copyfile(source, temporary)
+    temporary.replace(asset)
+    return "./" + asset.relative_to(project).as_posix()
 
 
 def export_hypit_project(
@@ -319,6 +337,16 @@ def export_hypit_project(
     shots = plan.get("shots") or []
     if not shots:
         raise ValueError("REBEAT-PLAN.json has no shots")
+    spanning = any({"audio_owner", "audio_in", "audio_out", "visual_sec"} & row.keys() for row in shots)
+    timeline = build_assembly_timeline(film, shots, durations={
+        row["id"]: ffprobe_duration(film / "shots" / f"{row['id']}.mp4")
+        if (film / "shots" / f"{row['id']}.mp4").is_file() else row.get("audio_source_sec", row["sec"])
+        for row in shots}) if spanning else None
+    try:
+        from .voice_lock import shot_roles
+    except ImportError:
+        from voice_lock import shot_roles
+    roles = shot_roles(film)
 
     dest = Path(out_dir) if out_dir else (film / "hypit-project")
     dest.mkdir(parents=True, exist_ok=True)
@@ -344,14 +372,15 @@ def export_hypit_project(
         win_id = f"w-{seg_name}"
         body = _shot_script_body(film, s)
         if body:
-            script_lines.append(f"    <{seg_name}><HOST>{body}</HOST></{seg_name}>")
+            role = roles[sid] or "HOST"
+            script_lines.append(f"    <{seg_name}><{role}>{body}</{seg_name}>")
         else:
             script_lines.append(f"    <{seg_name}/>")
 
         shot_mp4 = film / "shots" / f"{sid}.mp4"
         if shot_mp4.is_file():
-            src_ref = _rel_pos(shot_mp4, dest)
-            media_lines.append(f'  <file id="raw-{seg_name}" from="{xml_escape(src_ref)}"/>')
+            src_ref = _project_asset(shot_mp4, dest, f"{sid}.mp4")
+            media_lines.append(f'  <media:Video id="raw-{seg_name}" src={quoteattr(src_ref)}/>')
             media_lines.append(
                 f'  <mediaop:Normalize id="norm-{seg_name}" source={{raw-{seg_name}}} clock={{clock}} '
                 f'video="primary-moving" audio="default" span-authority="video"/>'
@@ -360,10 +389,12 @@ def export_hypit_project(
         else:
             sec = s.get("sec") or 6
             extent_expr = f'"{sec}s"'
+        if timeline:
+            extent_expr = f'"{timeline["visuals"][idx]["duration"]:g}s"'
 
-        from_attr = 'from="start"' if idx == 0 else f'from={{{prev_anchor}}}'
+        from_attr = f'from="{prev_anchor}"'
         timeline_windows.append(f'    <time:Window id="{win_id}" {from_attr} for={extent_expr}/>')
-        prev_anchor = f"main-timeline.{win_id}.end"
+        prev_anchor = f"{win_id}.end"
         last_win = win_id
 
         if shot_mp4.is_file():
@@ -371,16 +402,33 @@ def export_hypit_project(
                 f'    <visual:Clip id="v-{seg_name}" media={{norm-{seg_name}.media}} '
                 f'during={{main-timeline.{win_id}}} frame={{full}} z="10" fit="cover"/>'
             )
-            audio_clips.append(
-                f'    <audio:Clip id="a-{seg_name}" source={{norm-{seg_name}.media}} '
-                f'during={{main-timeline.{win_id}}}/>'
-            )
+            if not timeline and not s.get("silent"):
+                audio_clips.append(
+                    f'    <audio:Clip id="a-{seg_name}" source={{norm-{seg_name}.media}} '
+                    f'during={{main-timeline.{win_id}}}/>'
+                )
+
+    if timeline:
+        for index, span in enumerate(timeline["audio"], 1):
+            owner = span["owner"].lower()
+            if span["silent"] or not (film / "shots" / f"{span['owner']}.mp4").is_file():
+                continue
+            anchor = span["first_shot"].lower()
+            duration = span["end"] - span["start"]
+            timeline_windows.append(f'    <time:Window id="audio-{index}" from="w-{anchor}.start" for="{duration:g}s"/>')
+            audio_clips.append(f'    <audio:Clip id="a-{index}" source={{norm-{owner}.media}} during={{main-timeline.audio-{index}}}>\n'
+                               f'      <audio:Map target-at="start" source-at="{span["audio_in"]:g}s" '
+                               f'source-from="{span["audio_in"]:g}s" source-until="{span["audio_out"]:g}s" rate="1"/>\n'
+                               '    </audio:Clip>')
 
     bgm_file = next((film / "qa").glob("bgm.*"), None) or next((film).glob("bgm.*"), None)
-    if bgm_file and bgm_file.is_file():
-        bgm_ref = _rel_pos(bgm_file, dest)
-        media_lines.append(f'  <file id="raw-bgm" from="{xml_escape(bgm_ref)}"/>')
-        audio_clips.append('    <audio:Clip id="bgm-bed" source={raw-bgm} from="start" gain="-14dB"/>')
+    if bgm_file and bgm_file.is_file() and last_win:
+        bgm_ref = _project_asset(bgm_file, dest, "bgm" + bgm_file.suffix.lower())
+        media_lines.append(f'  <media:Audio id="raw-bgm" src={quoteattr(bgm_ref)}/>')
+        media_lines.append('  <mediaop:Normalize id="norm-bgm" source={raw-bgm} clock={clock} video="none" audio="default" span-authority="audio"/>')
+        timeline_windows.append(f'    <time:Window id="bgm-window" from="start" until="{last_win}.end"/>')
+        audio_clips.append('    <audio:Clip id="bgm-bed" source={norm-bgm.media} during={main-timeline.bgm-window} gain="0.2">\n'
+                           '      <audio:Map rate="1" wrap-from="start" wrap-until="end"/>\n    </audio:Clip>')
 
     end_ref = f"{last_win}.end" if last_win else '"0s"'
     svml = "\n".join(
@@ -396,6 +444,7 @@ def export_hypit_project(
             '  <import as="space" from="@hypit/spatial@1"/>',
             '  <import as="film" from="@hypit/film@1"/>',
             '  <import as="html" from="@hypit/html-video@1"/>',
+            '  <import as="recipes" source="./recipes.svs"/>',
             "",
             '  <script id="story">',
             *script_lines,
@@ -410,12 +459,10 @@ def export_hypit_project(
             '  <visual:Track id="main-visual" timeline={main-timeline.timeline}>',
             *visual_clips,
             "  </visual:Track>",
-            '  <audio:Track id="main-audio" timeline={main-timeline.timeline}>',
-            *audio_clips,
-            "  </audio:Track>",
-            '  <film:Film id="main" canvas={canvas.canvas} timeline={main-timeline.timeline}>',
+            *(['  <audio:Track id="main-audio" timeline={main-timeline.timeline}>', *audio_clips, '  </audio:Track>'] if audio_clips else []),
+            '  <film:Film id="main" canvas={canvas.canvas} timeline={main-timeline.timeline} appearance={recipes.film.vertical}>',
             "    <film:Track source={main-visual.visual}/>",
-            "    <film:Track source={main-audio.audio}/>",
+            *(["    <film:Track source={main-audio.audio}/>"] if audio_clips else []),
             "  </film:Film>",
             '  <html:Video id="final" composition={main.composition} timeline={main-timeline.timeline}/>',
             "</svml>",
@@ -436,6 +483,11 @@ def export_hypit_project(
     svrun_path = dest / "render.svrun"
     svml_path.write_text(svml)
     svrun_path.write_text(svrun)
+    (dest / "recipes.svs").write_text('''<?svml using="@hypit/recipe@1"?>
+<sheet version="1">
+  film.vertical { background: #000000; }
+</sheet>
+''')
 
     return {
         "ok": True,

@@ -9,13 +9,13 @@ Fail-closed `/replica` 生产闸门：缺产物不能进下一步；H3 / 拼装 
 
 | 阶段 | 要交的东西 |
 | --- | --- |
-| `1_read_source` | `qa/source.json` + `cuts.json` + `presenter-place.md` |
+| `1_read_source` | `qa/source.json` + `cuts.json` + `presenter-place.md` + `source-asr.json`（无语音须显式 `silent_source: true`） |
 | `2_vo_adapt` | `VO-REMAKE.md` + `vo-density.json`（密度闸） |
-| `3_beat_plan` | `REBEAT-PLAN.json`（4–15s；禁无依据固定 7 镜） |
+| `3_beat_plan` | `REBEAT-PLAN.json`（4–15s；禁无依据固定 7 镜）；过闸生成 `qa/SCRIPT-LOCK.json` |
 | `4_stills` | 每镜 `first-frames/h3/Sxx-first.jpg` + **`STILL-PRODUCT-LOCK.json`** + **`VLM-STILL-REVIEW.json`** + `SIZE-LOCK.json` + `PERSON-LOCK.json` + `still-contact-sheet.jpg`（+ 绑 sha256 的 `still-contact-sheet.json` 清单） |
-| `5_h3` | 每镜 `shots/Sxx.mp4` + `H3-MEANING.md` + **`H3-VISUAL-LOCK.json`（4 帧抽检）** + S01 后音色锁 |
+| `5_h3` | 每镜 `shots/Sxx.mp4` + `accept-shot` 回执 + `H3-MEANING.json` + **`H3-VISUAL-LOCK.json`（4 帧抽检）** + 分角色音色锁 |
 | `6_assemble` | 去杂音 + ASR 逐字对齐大字幕（56px@1152）+ BGM（**优先源配乐**）+ `assemble-check.json` |
-| `7_superres` | 须用户 `allow-superres` |
+| `7_superres` | 用户 `allow-superres` + `qa/SUPERRES.json` + `<film_name>.mp4`（验证过的 2× 超分） |
 
 ## 静帧主路径
 
@@ -52,7 +52,7 @@ Hypit 切源片 → 提每镜首帧 → AI **只换商品**（锁样式 + 大小
 
 1. **人物** — `PERSON-LOCK.json`：定妆后跟本条复刻人物（通常 S01），禁止自由换人换装  
 2. **体量** — `SIZE-LOCK.json`：`user_spec`（说了尺寸）或 `first_frame`（没说跟 S01）  
-3. **音色** — S01 `i2v` → `qa/voice-lock/S01-voice.wav`；S02+ 必须 `ref2v`（静帧 + S01 wav）  
+3. **音色** — 每个角色首个口播镜验收后提取音色；同角色后续镜必须 `ref2v`（静帧 + 该角色 WAV）。默认 `HOST`，保留 `qa/voice-lock/S01-voice.wav`。
 4. **BGM** — 能抽就用源配乐压在复刻人声下；不行再新曲。口播仍用生成声
 
 ### `user_spec` 体量证据（硬）
@@ -117,8 +117,12 @@ pip install -e .
 python -m replica_pipeline init --batch .
 python -m replica_pipeline status FILM_DIR
 python -m replica_pipeline require FILM_DIR h3_submit --shot S01
+python -m replica_pipeline require FILM_DIR stills
+python -m replica_pipeline preflight FILM_DIR --before stills|h3|assemble [--shot S01]
 python -m replica_pipeline advance FILM_DIR
-python -m replica_pipeline extract-voice FILM_DIR
+python -m replica_pipeline asr-verify FILM_DIR --shot S01 [--asr-path FILE] [--language zh]
+python -m replica_pipeline accept-shot FILM_DIR --shot S01 [--asr-path FILE] [--vlm-provider none|auto|codex|openai]
+python -m replica_pipeline extract-voice FILM_DIR [--role HOST] [--shot S01] [--force]
 python -m replica_pipeline inspect-stills FILM_DIR             # 首帧宽高比/分辨率检查 + 生成带标签同框对比板（重画静帧后必须重跑）
 python -m replica_pipeline product-review FILM_DIR --shot S01 # 结构化商品锁（禁裸 PASS，绑 sha256）
 python -m replica_pipeline size-review FILM_DIR --shot S01 --mode worn --vs-source smaller --refs front-with-size.jpg,worn-scale-ref.jpg
@@ -128,6 +132,7 @@ python -m replica_pipeline inspect-shots FILM_DIR              # 抽 4 帧联系
 python -m replica_pipeline vlm-review-video FILM_DIR           # 独立 VLM 复审视频 4 帧联系表
 python -m replica_pipeline video-review FILM_DIR --shot S01    # 手动补录视频画面过检（绑 shot_sha256）
 python -m replica_pipeline allow-superres FILM_DIR
+python -m replica_pipeline superres FILM_DIR [--base-url URL] [--resume]
 python -m replica_pipeline audit-batch --batch .
 python -m replica_pipeline source-prepare FILM_DIR --source src.mp4 [--extract-bgm] [--use-hypit] [--transcribe]
 python -m replica_pipeline extract-bgm FILM_DIR --source src.mp4 [--engine auto|demucs|audio-separator|center-cancel] # 剥离原片人声与可用BGM
@@ -137,6 +142,8 @@ python -m replica_pipeline candidate-list FILM_DIR [--shot S01]     # 查看历�
 python -m replica_pipeline candidate-archive FILM_DIR --shot S01 --clear # 归档保留旧渲染再重跑
 python -m replica_pipeline candidate-select FILM_DIR --shot S01 --candidate S01-attempt001
 python -m replica_pipeline assemble FILM_DIR --bgm qa/bgm.wav       # 去杂音 + 压Bgm(sidechain) + ASR抖音大字幕拼装
+python -m replica_pipeline assemble FILM_DIR --matrix-seed film-01 # 可选：可复现的轻微画面差异
+python -m replica_pipeline audit-matrix --batch BATCH [--batch ANOTHER_BATCH] [--policy FILE]
 python -m replica_pipeline review-html --batch .                    # 生成带时间戳评论区(FEEDBACK.json)与对比板审片页
 python -m replica_pipeline export-hypit FILM_DIR                    # 导出可编辑 Hypit SVML/SVRun 工程
 replica-pipeline status FILM_DIR   # console script
@@ -152,6 +159,20 @@ replica-pipeline status FILM_DIR   # console script
 - **Hypit 双向桥接（`hypit_bridge`）**：`source-prepare` 优先走 `hypit media` / `hypit transcribe` 并本地回退；`export-hypit` 一键吐出标准 `@hypit/markup@1` `production.svml` 与 `render.svrun`。
 
 Exit `2` = 闸门拦截。
+
+## 上游锁与返工
+
+`advance`（或 `set … pass`）记录当前证据的哈希。`preflight` / `require` 重新验证所有前置阶段；改动源片、台词、参考图、静帧或视频后，旧 `PASS` 不能替代复审。改动上游证据并重新通过该阶段后，下游阶段恢复待验。旧项目按顺序重新过闸；仅有 `H3-MEANING.md` 的历史项目需为每镜重新跑 `accept-shot`，并保证视觉锁与当前视频一致。
+
+- `source.json` 记录源视频 `path`、正数 `duration` 和 `cuts_path` / `asr_path`（默认 `qa/cuts.json` / `qa/source-asr.json`）。切点用 `{"cuts": [{"t": 1.25}]}` 表示，须递增且在片长内。密度按 ASR 与重制稿实际口播的字母、数字、汉字计数（不计空格标点）；`ratio = remake_chars / source_chars`，明确无源语音时填 `0`。
+- `VO-REMAKE.md` 可用纯口播、`S01: …` 逐镜行，或 `<d>…</d>` 段。`REBEAT-PLAN.json` 的 `spoken` 和 H3 prompt 的 `<d>…</d>` 必须一致。`<99元|九十九元>` 向 H3/ASR 用右侧、向字幕用左侧。`role` 或 `<HOST>` / `<GUEST>` 指定说话人；不要给借用别镜音轨的 B-roll 写新台词。S01 钩子要在 3 秒内落地；通用开场必须写 `allow_generic_hook: true` 与 `allow_generic_hook_reason`。静音开场需 `silent: true`、视觉 `hook` 与 `hook_end_sec`。
+- H3 下载后自动验收：完整解码、时长、WhisperX 文本、音频杂音及新 4 帧表。若停在 `NEEDS_ACCEPTANCE`，修复证据后跑 `accept-shot`，不会重复 POST，也不会提前发布音色。ASR 优先复用 `qa/asr/Sxx.json`，缺失时用 `hypit transcribe`；可显式给现有 ASR 文件，字幕需要词级时间戳。`--vlm-provider none` 不运行 VLM，但第 5 步仍要求独立视觉锁。
+
+## 跨镜音轨、矩阵与超分
+
+- A-roll 例：S01 `{"sec":4,"audio_source_sec":8}`，S02 `{"sec":4,"audio_owner":"S01","audio_in":4,"audio_out":8}`。前 4 秒取 S01 画面，后 4 秒取 S02 画面，8 秒音频都来自 S01，字幕由 S01 的 ASR 贯穿剪切点。也可设 S01 `sec: 8`，用紧接的 S02 `audio_in: 4` 指定视觉剪切点。导出的 Hypit 工程把同一音轨作为跨镜音频窗口，并把所需素材放进工程的 `assets/`。
+- BGM 使用 180ms 前视、800ms 释放的对白压低。导出 MP4 去除输入容器元数据与 chapters；`--matrix-seed` 可复现轻微缩放和色彩差异，参数写进 `assemble-check.json`。它不替代矩阵查重。`audit-matrix` 写 `MATRIX-AUDIT.json` / `.md`，对重复 BGM、商品基准图及相近口播/开场报错；品牌共用 BGM 可用 `{"allowed_bgm_sha256":["<64 位哈希>"]}` 豁免。
+- 超分前通过第 6 步并由用户执行 `allow-superres`。配置 `SUPERRES_BASE_URL` / `SUPERRES_API_KEY`（也接受 `H3_SUPERRES_URL` / `H3_SUPERRES_API_KEY`，密钥可用 macOS Keychain）。`superres --resume` 复用 `qa/superres.task.json` 的任务 ID 和服务器上传偏移；下载校验字节数、SHA-256、尺寸和完整解码后才发布成片。超分结果没有音轨时，把已验收成片的音轨拷回去。完成后用 `advance` 验收第 7 步。
 
 ## 片子里怎么交 H3
 

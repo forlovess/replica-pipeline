@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -21,24 +22,22 @@ from pathlib import Path
 try:
     from .candidates import archive_current_shot
     from .gate import require as pipeline_require
-    from .script_lint import lint_prompt, load_brief_rules
-    from .video_qa import extract_shot_contact_sheet
+    from .script_lint import ROLE_RE, lint_prompt, load_brief_rules, project_dual_text, read_strict_json
+    from .video_qa import extract_shot_contact_sheet, ffprobe_duration, file_sha256, has_audio_stream, scan_audio_glitches
     from .voice_lock import (
         ensure_voice_lock,
         first_shot_id,
-        voice_lock_path,
-        voice_meta_path,
+        voice_requirements,
     )
 except ImportError:  # flat `_pipeline/` on disk
     from candidates import archive_current_shot
     from gate import require as pipeline_require
-    from script_lint import lint_prompt, load_brief_rules
-    from video_qa import extract_shot_contact_sheet
+    from script_lint import ROLE_RE, lint_prompt, load_brief_rules, project_dual_text, read_strict_json
+    from video_qa import extract_shot_contact_sheet, ffprobe_duration, file_sha256, has_audio_stream, scan_audio_glitches
     from voice_lock import (
         ensure_voice_lock,
         first_shot_id,
-        voice_lock_path,
-        voice_meta_path,
+        voice_requirements,
     )
 
 BASE = "http://10.10.254.110:28000"
@@ -82,22 +81,23 @@ def req(key: str, path: str, method: str = "GET", body=None, timeout: int = 120)
         return res.read()
 
 
-def inject_audio_tag(prompt: str) -> str:
+def inject_audio_tag(prompt: str, *, role: str | None = None) -> str:
     """Ensure prompt references <Audio 1> for voice-timbre lock."""
     if "<Audio 1>" in prompt:
         return prompt
+    speaker = f"the {role} speaker" if role and role != "HOST" else "(S1)"
     tag = (
-        "<Audio 1> is the voice-timbre lock for (S1) across the whole film; "
+        f"<Audio 1> is the voice-timbre lock for {speaker} across the whole film; "
         "keep the same speaker identity and room tone.\n"
     )
     # Prefer insert after Picture line if present
     lines = prompt.splitlines(keepends=True)
     out = []
     inserted = False
-    for i, line in enumerate(lines):
+    for line in lines:
         out.append(line)
         if not inserted and "<Picture 1>" in line:
-            out.append(tag if tag.endswith("\n") else tag + "\n")
+            out.append(("" if line.endswith("\n") else "\n") + tag)
             inserted = True
     if not inserted:
         out.insert(0, tag if tag.endswith("\n") else tag + "\n")
@@ -113,6 +113,7 @@ def active_task_guard(tasks_dir: Path, taskf: Path) -> None:
         "CANCELED",
         "REJECTED",
         "ASR_SCREENED",
+        "NEEDS_ACCEPTANCE",
     }
     ok_done = {"COMPLETED", "SUCCEEDED", "SUCCESS", "DOWNLOADED"} | terminal
     for other in tasks_dir.glob("*.task.json"):
@@ -134,10 +135,13 @@ def build_payload(
     seed: int = 83,
 ) -> tuple[dict, dict]:
     """Return (payload, meta)."""
-    s01 = first_shot_id(film)
+    film = Path(film)
+    role, _, vpath = voice_requirements(film, shot, strict=False, prompt=prompt)
+    raw_sha = hashlib.sha256(prompt.encode()).hexdigest()
+    prompt = ROLE_RE.sub("", project_dual_text(prompt))
     frame_b64 = base64.b64encode(frame.read_bytes()).decode()
 
-    if shot == s01:
+    if vpath is None:
         payload = {
             "mode": "i2v",
             "prompt": prompt,
@@ -147,17 +151,11 @@ def build_payload(
             "seed": seed,
             "firstFrameBase64": frame_b64,
         }
-        meta = {"mode": "i2v", "voice_ref": None, "size_still": str(frame)}
+        meta = {"mode": "i2v", "voice_ref": None, "size_still": str(frame), "role": role,
+                "raw_prompt_sha256": raw_sha, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
         return payload, meta
 
-    # S02+: require voice lock from S01
-    vpath = voice_lock_path(film)
-    if not vpath.is_file():
-        raise SystemExit(
-            f"GATE FAIL: missing {vpath} — finish S01 download then "
-            f"`python3 _pipeline/pipeline.py extract-voice {film}`"
-        )
-    prompt2 = inject_audio_tag(prompt)
+    prompt2 = inject_audio_tag(prompt, role=role)
     payload = {
         "mode": "ref2v",
         "prompt": prompt2,
@@ -171,12 +169,96 @@ def build_payload(
     }
     meta = {
         "mode": "ref2v",
+        "role": role,
+        "raw_prompt_sha256": raw_sha,
+        "prompt_sha256": hashlib.sha256(prompt2.encode()).hexdigest(),
         "voice_ref": str(vpath),
         "voice_sha256": hashlib.sha256(vpath.read_bytes()).hexdigest(),
         "size_still": str(frame),
         "prompt_injected_audio_tag": prompt2 != prompt,
     }
     return payload, meta
+
+
+def _save_task(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def _validate_task_inputs(film: Path, shot: str, state: dict) -> None:
+    prompt_path = film / "prompts" / f"{shot}.txt"
+    frame = film / "first-frames/h3" / f"{shot}-first.jpg"
+    prompt = ROLE_RE.sub("", project_dual_text(prompt_path.read_text()))
+    if state.get("mode") == "ref2v":
+        role, _, wav = voice_requirements(film, shot)
+        prompt = inject_audio_tag(prompt, role=role)
+        if wav is None or state.get("voice_sha256") != file_sha256(wav):
+            raise ValueError(f"{shot}: voice reference changed since submission")
+    if (state.get("frame_sha256") and state["frame_sha256"] != file_sha256(frame)
+            or state.get("raw_prompt_sha256") and state["raw_prompt_sha256"] != file_sha256(prompt_path)
+            or state.get("prompt_sha256") and state["prompt_sha256"] != hashlib.sha256(prompt.encode()).hexdigest()):
+        raise ValueError(f"{shot}: task prompt or still changed since submission; archive before reroll")
+
+
+def accept_downloaded_shot(film: Path, shot: str, *, vlm_provider: str = "none", asr_path=None) -> dict:
+    try:
+        from .asr_verify import verify_shot_meaning
+        from .vlm_review import review_video_with_vlm
+    except ImportError:
+        from asr_verify import verify_shot_meaning
+        from vlm_review import review_video_with_vlm
+    film = Path(film).resolve()
+    pipeline_require(film, "h3_submit", shot=shot)
+    role, bootstrap, _ = voice_requirements(film, shot)
+    if vlm_provider not in {"none", "auto", "codex", "openai"}:
+        raise ValueError("invalid video VLM provider")
+    video = film / "shots" / f"{shot}.mp4"
+    task = film / "tasks" / f"{shot}.task.json"
+    state = read_strict_json(task) if task.is_file() else {}
+    state.update(state="NEEDS_ACCEPTANCE", shot=shot)
+    _save_task(task, state)
+    try:
+        _validate_task_inputs(film, shot, state)
+        digest = file_sha256(video)
+        if state.get("download_sha256", state.get("sha256", digest)) != digest:
+            raise ValueError(f"{shot}: downloaded video changed; select a tracked candidate or reroll")
+        duration = ffprobe_duration(video)
+        planned = _planned_shot_sec(film, shot) or state.get("duration")
+        if not math.isfinite(duration) or not 0 < duration or (planned and abs(duration - float(planned)) > 0.5):
+            raise ValueError(f"{shot}: decoded duration {duration}s disagrees with {planned}s")
+        subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", str(video), "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"], check=True)
+        audio = has_audio_stream(video)
+        if not role and asr_path is None and not audio:
+            empty = film / "qa/asr" / f"{shot}.json"
+            empty.parent.mkdir(parents=True, exist_ok=True)
+            empty.write_text(json.dumps({"segments": [], "video_sha256": digest}) + "\n")
+        meaning = verify_shot_meaning(film, shot, asr_path=asr_path)
+        if meaning["verdict"] != "PASS":
+            raise ValueError(f"{shot}: ASR meaning failed: {'; '.join(meaning['issues'])}")
+        glitches = scan_audio_glitches(video) if audio else {}
+        if role and (not glitches.get("segments") or glitches.get("mid_speech_glitches") or
+                     any(pause["duration"] >= 1.5 for pause in glitches.get("long_pauses", []))):
+            raise ValueError(f"{shot}: missing audio or unrecoverable mid-speech glitches")
+        sheet = extract_shot_contact_sheet(film, shot)
+        if not sheet.is_file():
+            raise ValueError(f"{shot}: contact sheet was not generated")
+        if vlm_provider != "none" and review_video_with_vlm(film, shot, provider=vlm_provider)["status"] != "PASS":
+            raise ValueError(f"{shot}: VLM video review failed")
+        if file_sha256(video) != digest:
+            raise ValueError(f"{shot}: video changed during acceptance")
+        voice = ensure_voice_lock(film, role=role, shot=shot) if role and shot == bootstrap else None
+        state.pop("acceptance_error", None)
+        state.update(state="DOWNLOADED", sha256=digest, duration=duration, role=role,
+                     technical_decode="PASS", acceptance="PASS", contact_sheet_sha256=file_sha256(sheet),
+                     acceptance_asr_sha256=meaning["asr_sha256"])
+        _save_task(task, state)
+        return {"ok": True, "shot": shot, "meaning": meaning, "contact_sheet": str(sheet), "voice": voice}
+    except Exception as exc:
+        state.update(state="NEEDS_ACCEPTANCE", acceptance="FAIL", acceptance_error=str(exc))
+        _save_task(task, state)
+        raise
 
 
 def _planned_shot_sec(film: Path, shot: str) -> float | None:
@@ -186,7 +268,7 @@ def _planned_shot_sec(film: Path, shot: str) -> float | None:
     try:
         for s in json.loads(plan_p.read_text()).get("shots") or []:
             if s.get("id") == shot and s.get("sec") is not None:
-                return float(s["sec"])
+                return float(s.get("audio_source_sec", s["sec"]))
     except Exception:
         return None
     return None
@@ -206,7 +288,7 @@ def run(
     plan_sec = _planned_shot_sec(film, shot)
     if duration is None:
         duration = plan_sec if plan_sec is not None else 10.0
-    elif plan_sec is not None and abs(float(duration) - plan_sec) > 2.0:
+    elif plan_sec is not None and abs(float(duration) - plan_sec) > 0.5:
         raise SystemExit(
             f"GATE FAIL: {shot} requested duration={duration}s conflicts with "
             f"REBEAT-PLAN.json sec={plan_sec}s"
@@ -226,11 +308,16 @@ def run(
     taskf.parent.mkdir(parents=True, exist_ok=True)
     video.parent.mkdir(parents=True, exist_ok=True)
 
-    assert frame.is_file(), frame
+    if not frame.is_file():
+        raise FileNotFoundError(frame)
     prompt = prompt_path.read_text()
-    assert prompt.strip()
+    if not prompt.strip():
+        raise ValueError(f"empty prompt {prompt_path}")
 
     if reroll and (video.is_file() or taskf.is_file()):
+        previous = read_strict_json(taskf) if taskf.is_file() else {}
+        if not previous.get("task_id") and previous.get("state") in {"SUBMITTING", "UNCERTAIN_SUBMIT"}:
+            raise ValueError(f"{shot}: recover uncertain submission before rerolling")
         archived = archive_current_shot(
             film,
             shot,
@@ -241,50 +328,34 @@ def run(
             log(shot, "ARCHIVED", archived["candidate_id"], archived.get("visual_status"))
 
     s01 = first_shot_id(film)
+    role, bootstrap, _ = voice_requirements(film, shot)
     lint = lint_prompt(
         prompt,
         shot_id=shot,
         shot_sec=float(duration),
-        is_first_shot=(shot == s01),
+        is_first_shot=(shot == s01 or shot == bootstrap),
         rules=load_brief_rules(film),
+        silent=not role,
     )
     for w in lint["warnings"]:
         log(shot, "PROMPT_WARN", w)
     if not lint["ok"]:
         raise SystemExit("PROMPT LINT FAIL:\n  - " + "\n  - ".join(lint["errors"]))
 
-    key = api_key()
-    state = json.loads(taskf.read_text()) if taskf.exists() else {}
+    state = read_strict_json(taskf) if taskf.is_file() else {}
 
     def save() -> None:
-        tmp = taskf.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-        tmp.replace(taskf)
-
-    active_task_guard(film / "tasks", taskf)
+        _save_task(taskf, state)
 
     if state.get("task_id"):
-        # Fail closed if still, prompt, or S01 voice-lock wav changed since task_id was issued.
-        cur_frame_sha = hashlib.sha256(frame.read_bytes()).hexdigest()
-        s01 = first_shot_id(film)
-        effective_prompt = prompt if shot == s01 else inject_audio_tag(prompt)
-        cur_prompt_sha = hashlib.sha256(effective_prompt.encode()).hexdigest()
-        stale_reasons = []
-        if state.get("frame_sha256") and state["frame_sha256"] != cur_frame_sha:
-            stale_reasons.append("first-frame still")
-        if state.get("prompt_sha256") and state["prompt_sha256"] != cur_prompt_sha:
-            stale_reasons.append("prompt")
-        if shot != s01 and state.get("voice_sha256"):
-            vpath = voice_lock_path(film)
-            if vpath.is_file():
-                cur_voice_sha = hashlib.sha256(vpath.read_bytes()).hexdigest()
-                if state["voice_sha256"] != cur_voice_sha:
-                    stale_reasons.append("S01-voice.wav")
-        if stale_reasons:
-            raise SystemExit(
-                f"STALE TASK for {shot}: {', '.join(stale_reasons)} changed since submission "
-                f"(task_id={state['task_id']}). Archive/remove {taskf} before resubmitting."
-            )
+        _validate_task_inputs(film, shot, state)
+    if video.is_file() and state.get("state") in {"NEEDS_ACCEPTANCE", "DOWNLOADED", "COMPLETED", "SUCCEEDED", "SUCCESS"}:
+        accept_downloaded_shot(film, shot)
+        return 0
+    if video.is_file() and not state.get("task_id"):
+        raise ValueError(f"{shot}: existing untracked video; run accept-shot or use --reroll")
+    active_task_guard(film / "tasks", taskf)
+    key = api_key()
 
     if not state.get("task_id"):
         if state.get("state") in {"SUBMITTING", "UNCERTAIN_SUBMIT"}:
@@ -298,9 +369,9 @@ def run(
             "duration": duration,
             "frame": str(frame),
             "frame_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
-            "prompt_sha256": hashlib.sha256(
-                (payload["prompt"]).encode()
-            ).hexdigest(),
+            "prompt_sha256": meta["prompt_sha256"],
+            "raw_prompt_sha256": file_sha256(prompt_path),
+            "role": meta["role"],
             "voice_ref": meta.get("voice_ref"),
             "voice_sha256": meta.get("voice_sha256"),
             "size_lock": str(size_lock),
@@ -362,63 +433,15 @@ def run(
                     req(key, "/v1/videos/" + state["task_id"] + "/file", timeout=300)
                 )
                 part.replace(video)
-                info = json.loads(
-                    subprocess.run(
-                        [
-                            "ffprobe",
-                            "-v",
-                            "error",
-                            "-show_entries",
-                            "format=duration",
-                            "-of",
-                            "json",
-                            str(video),
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    ).stdout
-                )
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-v",
-                        "error",
-                        "-i",
-                        str(video),
-                        "-map",
-                        "0",
-                        "-f",
-                        "null",
-                        "-",
-                    ],
-                    check=True,
-                )
-                state.update(
-                    state="DOWNLOADED",
-                    file=str(video),
-                    sha256=hashlib.sha256(video.read_bytes()).hexdigest(),
-                    duration=info.get("format", {}).get("duration"),
-                    technical_decode="PASS",
-                )
+                state.update(state="NEEDS_ACCEPTANCE", file=str(video), download_sha256=file_sha256(video))
                 save()
-                log(shot, "DOWNLOADED", state["duration"], video)
                 break
             time.sleep(12)
         else:
             raise SystemExit("Timeout waiting for completion")
 
-    # After S01 lands, refresh the film voice lock for later shots (fail-closed if broken)
-    if shot == first_shot_id(film):
-        meta = ensure_voice_lock(film, force=True)
-        log(shot, "VOICE_LOCK", meta.get("wav"), f"{meta.get('duration_sec')}s")
-
-    # Extract 4-frame contact sheet for mandatory visual QA
-    try:
-        sheet = extract_shot_contact_sheet(film, shot)
-        log(shot, "CONTACT_SHEET", sheet)
-    except Exception as e:
-        log(shot, "CONTACT_SHEET_WARN", type(e).__name__, str(e)[:160])
+    accept_downloaded_shot(film, shot)
+    state = read_strict_json(taskf)
 
     # Snapshot completed attempt into shots/candidates/ so later rerolls never lose it
     if video.is_file():
@@ -465,4 +488,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)

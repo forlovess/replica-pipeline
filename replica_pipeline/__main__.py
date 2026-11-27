@@ -1,3 +1,9 @@
-from replica_pipeline.pipeline import main
 import sys
-sys.exit(main())
+
+try:
+    from .pipeline import main
+except ImportError:
+    from pipeline import main
+
+if __name__ == "__main__":
+    sys.exit(main())

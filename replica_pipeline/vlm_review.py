@@ -395,8 +395,10 @@ def validate_vlm_still_review_data(
                 f"VLM-STILL-REVIEW.json: {sid} still_sha256 mismatch — still changed since VLM review"
             )
         refs_sha = entry.get("refs_sha256") or {}
+        cur_refs = {label: file_sha256(p) for label, p in _gather_still_refs(film, sid)[0]}
+        for label in sorted(cur_refs.keys() - refs_sha.keys()):
+            errs.append(f"VLM-STILL-REVIEW.json: {sid} new reference '{label}' — rerun review")
         if refs_sha:
-            cur_refs = {label: file_sha256(p) for label, p in _gather_still_refs(film, sid)[0]}
             for label, exp_sha in refs_sha.items():
                 if label not in cur_refs:
                     errs.append(f"VLM-STILL-REVIEW.json: {sid} reference '{label}' missing since VLM review")

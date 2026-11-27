@@ -12,10 +12,12 @@ before spending generation credits:
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,8 @@ HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
 DIGIT_RUN_RE = re.compile(r"\d+(?:\.\d+)?")
 TAG_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
+ROLE_RE = re.compile(r"<([A-Z][A-Z0-9_]{0,31})>")
+SHOT_RE = re.compile(r"S(?:0[1-9]|[1-9][0-9]+)")
 PICTURE_TAG_RE = re.compile(r"<\s*Picture\s+1\s*>", re.IGNORECASE)
 AUDIO_TAG_RE = re.compile(r"<\s*Audio\s+1\s*>", re.IGNORECASE)
 
@@ -75,6 +79,221 @@ def project_dual_text(text: str, *, side: str = "spoken") -> str:
         return spk if spk else disp
 
     return DUAL_TEXT_RE.sub(_repl, text)
+
+
+def compile_shot_text(raw_text: str, *, default_role: str = "HOST") -> dict[str, Any]:
+    if not isinstance(raw_text, str):
+        raise ValueError("shot text must be a string")
+    role = default_role
+    roles = set(ROLE_RE.findall(raw_text))
+    if len(roles) > 1 or not isinstance(role, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,31}", role):
+        raise ValueError("invalid or conflicting role cues")
+    if roles:
+        role = roles.pop()
+    clean = ROLE_RE.sub("", raw_text)
+    tags = re.findall(r"</?d>", clean, re.I)
+    if [tag.lower() for tag in tags] != ["<d>", "</d>"] * len(DIALOGUE_RE.findall(clean)):
+        raise ValueError("unbalanced <d> dialogue tags")
+    leftovers = DUAL_TEXT_RE.sub("", clean)
+    if re.search(r"<[^<>\n]*\||\|[^<>\n]*>|</?[A-Z][A-Z0-9_]*\b(?![^<>]*>)|</[A-Z][A-Z0-9_]*>|</?d(?=\s|$)", leftovers):
+        raise ValueError("malformed dual text or role/dialogue tag")
+    phrases = []
+    for segment in DIALOGUE_RE.findall(clean) if tags else clean.splitlines():
+        segment = TAG_PREFIX_RE.sub("", segment).strip()
+        if not segment:
+            continue
+        for match in DUAL_TEXT_RE.finditer(segment):
+            if not any(part.strip() for part in match.groups()) or "|" in match[2]:
+                raise ValueError("dual text requires exactly one display and spoken value")
+        phrases.append({side: project_dual_text(segment, side=side) for side in ("display", "spoken")})
+    return {"raw": raw_text, "role": role, "phrases": phrases,
+            **{side: " ".join(part[side] for part in phrases) for side in ("display", "spoken")}}
+
+
+def speech_chars(text: str) -> str:
+    return "".join(char for char in unicodedata.normalize("NFKC", text).casefold() if char.isalnum())
+
+
+def spoken_signature(text: str) -> list[str]:
+    return re.findall(r"\d+(?:\.\d+)?|[a-z]+(?:'[a-z]+)?|[\u3400-\u9fff]", unicodedata.normalize("NFKC", text).casefold())
+
+
+def read_strict_json(path: Path) -> dict:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"duplicate key {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"invalid constant {value}")
+
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=pairs, parse_constant=reject_constant)
+        if not isinstance(data, dict):
+            raise ValueError("expected JSON object")
+        return data
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{path.name}: {exc}") from exc
+
+
+def lint_hook(shot: dict, *, rules: dict | None = None) -> list[str]:
+    rules = rules or {}
+    text = compile_shot_text(shot.get("spoken") or shot.get("vo") or "")["spoken"]
+    start = shot.get("hook_start_sec", shot.get("hook_start", 0))
+    end = shot.get("hook_end_sec", shot.get("hook_end"))
+    silent = shot.get("silent") is True
+    hook = shot.get("hook") or re.split(r"[，。！？,.!?]", text, maxsplit=1)[0]
+    errors = []
+    if not isinstance(hook, str):
+        return ["S01: hook must be text"]
+    if not speech_chars(hook) or (not silent and not speech_chars(text).startswith(speech_chars(hook))):
+        errors.append("S01: missing or contradictory opening hook")
+    if (type(start) not in (int, float) or not 0 <= start < 3 or
+            (end is not None and (type(end) not in (int, float) or not start < end <= 3)) or
+            (silent and end is None) or
+            (not silent and end is None and isinstance(start, (int, float)) and start + count_speech_units(hook) / PACE_RATES_ZH["normal"] > 3)):
+        errors.append("S01: opening hook must land within 3s")
+    if re.match(r"(?:大家好|哈喽大家好|今天给大家推荐|Hello\b|Hi everyone\b)", text, re.I):
+        allowed = shot if "allow_generic_hook" in shot else rules
+        reason = allowed.get("generic_hook_reason") or allowed.get("allow_generic_hook_reason") or allowed.get("hook_reason") or allowed.get("reason")
+        if allowed.get("allow_generic_hook") is not True or not isinstance(reason, str) or not reason.strip():
+            errors.append("S01: generic opening requires allow_generic_hook=true and a reason")
+    return errors
+
+
+def plan_visual_durations(shots: list[dict], fallback_durations: dict[str, float]) -> dict[str, float]:
+    durations = {}
+    for index, row in enumerate(shots):
+        sid = row["id"]
+        duration = row.get("visual_sec", row.get("sec", fallback_durations[sid]))
+        if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+            raise ValueError(f"{sid}: invalid visual duration")
+        if index + 1 < len(shots) and not {"visual_sec", "audio_out"} & row.keys():
+            following = shots[index + 1]
+            cut = following.get("audio_in")
+            if following.get("audio_owner") == sid and type(cut) in (int, float) and 0 < cut < duration:
+                if type(row.get("audio_in", 0)) not in (int, float):
+                    raise ValueError(f"{sid}: invalid audio_in")
+                duration = cut - row.get("audio_in", 0)
+        if duration <= 0:
+            raise ValueError(f"{sid}: visual cut precedes audio start")
+        durations[sid] = float(duration)
+    return durations
+
+
+def audio_windows(shots: list[dict], durations: dict[str, float], *, source_durations: dict[str, float] | None = None) -> list[tuple[str, float, float]]:
+    windows = []
+    owners = {}
+    ends = {}
+    silent = {row["id"] for row in shots if row.get("silent")}
+    source_durations = source_durations or {row["id"]: row.get("audio_source_sec", durations[row["id"]]) for row in shots}
+    for row in shots:
+        sid = row["id"]
+        owner = row.get("audio_owner", sid)
+        if not isinstance(owner, str) or (owner != sid and (owner not in owners or owners[owner] != owner)):
+            raise ValueError(f"{sid}: audio_owner must be an earlier direct owner")
+        if owner != sid and not {"audio_in", "audio_out"} <= row.keys():
+            raise ValueError(f"{sid}: dependent audio requires audio_in and audio_out")
+        if owner != sid and owner in silent:
+            raise ValueError(f"{sid}: audio_owner {owner} is silent")
+        start = row.get("audio_in", 0)
+        end = row.get("audio_out", start + durations[sid] if type(start) in (int, float) else None)
+        if (type(start) not in (int, float) or type(end) not in (int, float)
+                or type(source_durations[owner]) not in (int, float) or not 0 <= start < end <= source_durations[owner] + 0.01
+                or (owner != sid and abs(end - start - durations[sid]) > 0.1)):
+            raise ValueError(f"{sid}: out-of-range audio span or span does not match visual duration")
+        if start + 0.001 < ends.get(owner, 0):
+            raise ValueError(f"{sid}: overlaps or reverses an earlier {owner} audio span")
+        ends[owner] = end
+        owners[sid] = owner
+        windows.append((owner, float(start), float(end)))
+    return windows
+
+
+def vo_remake_text(text: str) -> str:
+    if re.search(r"</?d>", text, re.I):
+        return text
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith(("#", "```"))]
+    per_shot = [match[1] for line in lines if (match := re.match(r"(?:[-*]\s*)?\**S\d+\**\s*[:：|]\s*(.+)", line))]
+    return "\n".join(per_shot or lines)
+
+
+def compile_remake_text(text: str) -> str:
+    return compile_shot_text(ROLE_RE.sub("", vo_remake_text(text)))["spoken"]
+
+
+def compile_script_contract(film: Path, *, write: bool = True) -> dict:
+    film = Path(film)
+    plan_path = film / "qa/REBEAT-PLAN.json"
+    vo_path = film / "qa/VO-REMAKE.md"
+    plan = read_strict_json(plan_path)
+    shots = plan.get("shots")
+    if not isinstance(shots, list) or not shots or not all(isinstance(row, dict) for row in shots):
+        raise ValueError("REBEAT-PLAN: expected nonempty shots array")
+    ids = [row.get("id") for row in shots]
+    if not all(isinstance(sid, str) and SHOT_RE.fullmatch(sid) for sid in ids) or len(set(ids)) != len(ids) or ids[0] != "S01":
+        raise ValueError("REBEAT-PLAN: unique valid shot IDs starting at S01 required")
+    if any(type(row.get("sec")) not in (int, float) or not 4 <= row["sec"] <= 15 for row in shots):
+        raise ValueError("REBEAT-PLAN: shot sec must be in [4, 15]")
+    for row in shots:
+        for key in ("audio_source_sec", "visual_sec"):
+            minimum = 4 if key == "audio_source_sec" else 0.001
+            if key in row and (type(row[key]) not in (int, float) or not minimum <= row[key] <= 15):
+                raise ValueError(f"{row['id']}: invalid {key}")
+        if row.get("audio_source_sec", row["sec"]) < row.get("visual_sec", row["sec"]):
+            raise ValueError(f"{row['id']}: source duration shorter than its visual window")
+    source_durations = {row["id"]: row.get("audio_source_sec", row["sec"]) for row in shots}
+    windows = audio_windows(shots, plan_visual_durations(shots, source_durations), source_durations=source_durations)
+    rules = load_brief_rules(film)
+    errors = lint_hook(shots[0], rules={**rules, **plan})
+    result = {"shots": {}, "inputs": {}}
+    paths = [plan_path, vo_path, *brief_rule_paths(film)]
+    for row, (owner, _, _) in zip(shots, windows):
+        sid = row["id"]
+        raw = row.get("spoken") or row.get("vo") or ""
+        prompt = film / "prompts" / f"{sid}.txt"
+        text = prompt.read_text() if prompt.is_file() else ""
+        prompt_roles = set(ROLE_RE.findall(text))
+        default_role = row.get("role", next(iter(prompt_roles)) if len(prompt_roles) == 1 else "HOST")
+        compiled = compile_shot_text(raw, default_role=default_role)
+        if row.get("role", compiled["role"]) != compiled["role"]:
+            errors.append(f"{sid}: role contradicts script cue")
+        spoken = compiled["spoken"]
+        if "silent" in row and type(row["silent"]) is not bool:
+            errors.append(f"{sid}: silent must be a boolean")
+        if row.get("spoken") and row.get("vo") and spoken_signature(compile_shot_text(row["vo"])["spoken"]) != spoken_signature(spoken):
+            errors.append(f"{sid}: spoken and vo fields disagree")
+        if row.get("phrases"):
+            phrase_spoken = " ".join(compile_shot_text(item["spoken"] if isinstance(item, dict) else item)["spoken"] for item in row["phrases"])
+            if spoken_signature(phrase_spoken) != spoken_signature(spoken):
+                errors.append(f"{sid}: caption phrases contradict spoken text")
+        if bool(spoken) == bool(row.get("silent") or owner != sid):
+            errors.append(f"{sid}: spoken content contradicts silent/audio ownership")
+        errors.extend(f"{sid}: {err}" for phrase in compiled["phrases"] for err in check_clause_integrity(phrase["spoken"]))
+        errors.extend(f"{sid}: {err}" for err in lint_claims(spoken, rules))
+        if prompt.is_file():
+            paths.append(prompt)
+            projected = compile_shot_text(text, default_role=compiled["role"])
+            if (projected["role"] != compiled["role"] or
+                    spoken_signature(projected["spoken"] if DIALOGUE_RE.search(text) else "") != spoken_signature(spoken)):
+                errors.append(f"{sid}: prompt dialogue or role contradicts REBEAT-PLAN")
+            errors.extend(lint_prompt(text, shot_id=sid, shot_sec=row.get("audio_source_sec", row["sec"]), is_first_shot=sid == "S01", rules=rules, silent=not spoken)["errors"])
+        result["shots"][sid] = compiled
+    vo_spoken = compile_remake_text(vo_path.read_text())
+    if spoken_signature(vo_spoken) != spoken_signature(" ".join(row["spoken"] for row in result["shots"].values())):
+        errors.append("VO-REMAKE.md spoken text contradicts REBEAT-PLAN")
+    if errors:
+        raise ValueError("; ".join(errors))
+    result["inputs"] = {str(path.relative_to(film.parent)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths if path.is_file()}
+    if write:
+        lock = film / "qa/SCRIPT-LOCK.json"
+        temporary = lock.with_suffix(".tmp")
+        temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        temporary.replace(lock)
+    return result
 
 
 def _estimate_english_syllables(word: str) -> int:
@@ -170,7 +389,7 @@ def extract_dialogue_segments(prompt_text: str) -> list[str]:
     """Return spoken strings extracted from `<d>...</d>` tags inside an H3 prompt."""
     out: list[str] = []
     for raw in DIALOGUE_RE.findall(prompt_text):
-        cleaned = TAG_PREFIX_RE.sub("", raw).strip()
+        cleaned = TAG_PREFIX_RE.sub("", ROLE_RE.sub("", raw)).strip()
         cleaned = project_dual_text(cleaned, side="spoken")
         if cleaned:
             out.append(cleaned)
@@ -204,22 +423,32 @@ def check_clause_integrity(text: str) -> list[str]:
     return errs
 
 
-def load_brief_rules(film: Path) -> dict[str, Any]:
-    """Load forbidden claims / prompt rules from `qa/BRIEF-RULES.json` or batch parent."""
-    film = Path(film)
-    for cand in (
+def brief_rule_paths(film: Path) -> tuple[Path, ...]:
+    return (
         film / "qa" / "BRIEF-RULES.json",
         film.parent / "qa" / "BRIEF-RULES.json",
         film.parent / "_shared" / "BRIEF-RULES.json",
-    ):
-        if cand.is_file():
-            try:
-                data = json.loads(cand.read_text())
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                pass
-    return {}
+    )
+
+
+def load_brief_rules(film: Path) -> dict[str, Any]:
+    documents = []
+    for path in brief_rule_paths(Path(film)):
+        if not path.is_file():
+            continue
+        data = read_strict_json(path)
+        for key in ("banned_terms", "banned_patterns"):
+            values = data.get(key, [])
+            if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                raise ValueError(f"{path.name}: {key} must be a list of strings")
+            if key == "banned_patterns":
+                for value in values:
+                    try:
+                        re.compile(value)
+                    except re.error as exc:
+                        raise ValueError(f"{path.name}: invalid banned pattern {value!r}: {exc}") from exc
+        documents.append(data)
+    return documents[0] if documents else {}
 
 
 def lint_claims(text: str, rules: dict[str, Any]) -> list[str]:

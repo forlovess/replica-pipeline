@@ -386,6 +386,13 @@ def validate_still_sheet(film: Path, shots: list) -> list[str]:
     elif file_sha256(sheet) != rec_sheet_sha:
         errs.append(f"{STILL_SHEET_NAME} modified since inspect-stills")
 
+    refs = dict(_resolve_ref_images(film))
+    for cell in man.get("cells") or []:
+        label = cell.get("label")
+        recorded = cell.get("source_sha256")
+        if label in {"SIZE-DIAGRAM", "WORN-SCALE-REF", "CANON"} and recorded:
+            if label not in refs or file_sha256(refs[label]) != recorded:
+                errs.append(f"{STILL_SHEET_NAME}: {label} changed — rerun inspect-stills")
     stills = man.get("stills") or {}
     for s in shots:
         sid = s["id"]

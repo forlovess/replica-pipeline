@@ -46,7 +46,7 @@ REQUIRED = {
     ],
     "5_h3": [
         "qa/H3-VISUAL-LOCK.json",  # per-shot 4-frame contact sheet review bound by shot_sha256
-        # plus dynamically: shots/Sxx.mp4 + H3-MEANING.md PASS + S01 VOICE-LOCK + ref2v
+        # plus dynamically: accepted shots, H3-MEANING.json and role voice banks
     ],
     "6_assemble": [
         "qa/captioned.mp4",
@@ -54,12 +54,14 @@ REQUIRED = {
         "qa/assemble-check.json",
     ],
     "7_superres": [
+        "qa/SUPERRES.json",
         "qa/superres-allow.json",  # {"allow": true, "by": "user"}
     ],
 }
 
 # Which stage must be PASS before an action is allowed.
 ACTION_REQUIRES = {
+    "stills": "3_beat_plan",
     "h3_submit": "4_stills",
     "assemble": "5_h3",
     "superres": "6_assemble",

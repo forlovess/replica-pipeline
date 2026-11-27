@@ -147,13 +147,35 @@ def scan_audio_glitches(path: Path, *, thresh_db: float = -34.0) -> dict[str, An
         for k in range(len(segs) - 1)
         if segs[k + 1][0] - segs[k][1] >= 0.80
     ]
+    mid_speech_glitches = [
+        {"start": start, "end": end}
+        for index, (start, end) in enumerate(segs[1:-1], 1)
+        if end - start <= 0.15 and start - segs[index - 1][1] >= 0.20
+        and segs[index + 1][0] - end >= 0.20
+        and max(dbs[round(start * 20):round(end * 20)] or [-100]) >= -8
+    ]
     return {
         "duration": round(dur, 3),
         "segments": segs,
         "leading_glitch": leading_glitch,
         "recommended_trim": [recommended_start, recommended_end],
         "long_pauses": long_pauses,
+        "mid_speech_glitches": mid_speech_glitches,
     }
+
+
+def has_audio_stream(path: Path) -> bool:
+    streams = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                                       "-show_entries", "stream=index", "-of", "csv=p=0", str(path)], text=True)
+    return bool(streams.strip())
+
+
+def accept_downloaded_shot(film: Path, shot: str, *, vlm_provider: str = "none", asr_path=None) -> dict:
+    try:
+        from .h3_submit import accept_downloaded_shot as accept
+    except ImportError:
+        from h3_submit import accept_downloaded_shot as accept
+    return accept(film, shot, vlm_provider=vlm_provider, asr_path=asr_path)
 
 
 def extract_shot_contact_sheet(
