@@ -1,16 +1,15 @@
-"""Film-level presenter consistency (same person across shots).
+"""Film-level presenter consistency (same remake person across shots).
 
-Source films keep one presenter through the piece. Remakes must too:
-gender / apparent age / hair / outfit / overall likeness stay locked—
-not a new adult each cut. Degree: recognizable same person, not
-pixel-perfect face ID; recasting or outfit swaps without source basis = FAIL.
+Do not freely reinvent the presenter each cut. Once the remake person is
+set (usually the accepted S01 still), later shots must stay that person:
+same gender / age band / hair / outfit / recognizable likeness.
 
-Authority:
-1. `qa/presenter-place.md` from source read (step 1) — who/where to match.
-2. Remake visual board = first accepted person still (usually S01)
-   written as `canon_still` in PERSON-LOCK.json.
-3. Later stills attach that canon still as a reference and keep the same
-   wardrobe + hair + age band.
+- Initial cast still follows source notes in `presenter-place.md`
+  (do not invent a new beauty type / place).
+- Continuity authority for S02+ is the **remake canon still**, not
+  pixel-matching the source face, and not a fresh improvisation.
+
+Degree: same remake person continuity — not source face-ID, not free casting.
 """
 from __future__ import annotations
 
@@ -40,14 +39,17 @@ def build_person_lock(
         "traits": {k: traits[k].strip() for k in REQUIRED_TRAITS},
         "shots": shots,
         "rule": (
-            "Same presenter across the film (source-level consistency). "
-            "Match traits + canon_still likeness; do not recast adult / hair / outfit "
-            "per shot unless the source itself changes wardrobe mid-film."
+            "Stay consistent with the remake person locked in canon_still (usually S01). "
+            "No free casting: do not invent a new adult / hair / outfit per shot."
         ),
         "degree": (
-            "Recognizable same person and wardrobe continuity — not pixel face-ID. "
-            "Fail if a later shot looks like a different adult, different hair length/color "
-            "band, or a new outfit without source basis."
+            "Match the remake canon person (recognizable + wardrobe continuity). "
+            "Not source face-ID; not free improvisation. "
+            "Fail if a later shot looks like a different adult or new outfit."
+        ),
+        "authority": (
+            "Remake canon_still wins for continuity. presenter-place.md only set the "
+            "initial cast from source; do not wander away from the locked remake person."
         ),
         "updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }

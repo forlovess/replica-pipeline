@@ -4,9 +4,9 @@ Fail-closed backend that forces the `/replica` skill order on every film.
 
 ## Film-level locks
 
-### Person (source-level continuity)
-- `qa/PERSON-LOCK.json` — same presenter across shots (gender/age/hair/outfit + S01 canon still).
-- Degree: recognizable same person, not pixel face-ID. Recast / wardrobe swap without source basis = FAIL.
+### Person (remake continuity — no free casting)
+- Cast from `presenter-place.md`, then lock `qa/PERSON-LOCK.json` to the remake canon still (usually S01).
+- Later shots must match **that remake person** (hair/outfit/likeness). Not source face-ID; not free improvisation.
 
 ### Voice (S01 → whole film)
 - S01 `i2v` → extract `qa/voice-lock/S01-voice.wav`
