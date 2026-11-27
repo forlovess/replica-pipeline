@@ -10,6 +10,8 @@ Usage:
   python pipeline.py gate-check FILM_DIR STAGE
   python pipeline.py audit-batch [BATCH_DIR]
   python pipeline.py void-sparse7 FILM_DIR    # mark old 7-shot sparse work void
+  python pipeline.py size-review FILM_DIR --shot S01 --mode worn \\
+      --vs-source smaller --refs front-with-size.jpg,worn-scale-ref.jpg
 
 Exit codes: 0 ok, 2 gate fail, 3 bad args.
 """
@@ -420,6 +422,17 @@ def cmd_require(args: argparse.Namespace) -> int:
         if not size_lock.is_file():
             print("GATE FAIL: missing qa/SIZE-LOCK.json (film-level product size)", file=sys.stderr)
             return 2
+        # Re-validate structured size evidence (user_spec must not paper-PASS)
+        if plan.is_file():
+            plan_shots = json.loads(plan.read_text()).get("shots") or []
+            size_errs = validate_size_lock(film, plan_shots)
+            if size_errs:
+                print(
+                    "GATE FAIL: SIZE-LOCK evidence:\n  - "
+                    + "\n  - ".join(size_errs),
+                    file=sys.stderr,
+                )
+                return 2
         person_lock = film / "qa/PERSON-LOCK.json"
         if not person_lock.is_file():
             print(
@@ -555,6 +568,50 @@ def cmd_extract_voice(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_size_review(args: argparse.Namespace) -> int:
+    """Record structured size evidence for one shot (required under user_spec)."""
+    try:
+        from .size_lock import apply_size_review, write_size_lock
+    except ImportError:
+        from size_lock import apply_size_review, write_size_lock
+
+    film = Path(args.film)
+    path = film / "qa" / "SIZE-LOCK.json"
+    if not path.is_file():
+        print(f"SIZE-LOCK.json missing: {path}", file=sys.stderr)
+        return 2
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        print(f"SIZE-LOCK.json: {e}", file=sys.stderr)
+        return 2
+
+    refs = [r.strip() for r in (args.refs or "").split(",") if r.strip()]
+    try:
+        data = apply_size_review(
+            data,
+            args.shot,
+            mode=args.mode,
+            vs_user_spec=args.vs_spec,
+            vs_source_occupancy=args.vs_source,
+            refs_used=refs,
+            note=args.note or "",
+            status=args.status,
+        )
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 3
+
+    write_size_lock(film, data)
+    print(
+        json.dumps(
+            {"ok": True, "shot": args.shot, "entry": data["shots"][args.shot]},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_audit_batch(args: argparse.Namespace) -> int:
     batch = Path(args.batch) if args.batch else Path(__file__).resolve().parent.parent
     rows = []
@@ -623,6 +680,36 @@ def main() -> int:
     p.add_argument("film")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_extract_voice)
+
+    p = sub.add_parser("size-review")
+    p.add_argument("film")
+    p.add_argument("--shot", required=True, help="Shot id, e.g. S01")
+    p.add_argument(
+        "--mode",
+        required=True,
+        choices=["worn", "handheld", "open", "detail", "other"],
+        help="How the product sits in this still",
+    )
+    p.add_argument(
+        "--vs-source",
+        dest="vs_source",
+        default="smaller",
+        help="vs source product occupancy: smaller|n/a (same/larger forbidden)",
+    )
+    p.add_argument(
+        "--vs-spec",
+        dest="vs_spec",
+        default="match",
+        help="Must be match — still follows user physical_cm / worn_rule",
+    )
+    p.add_argument(
+        "--refs",
+        default="",
+        help="Comma list, must include size diagram (e.g. front-with-size.jpg)",
+    )
+    p.add_argument("--note", default="")
+    p.add_argument("--status", default="PASS", choices=["PASS", "FAIL"])
+    p.set_defaults(func=cmd_size_review)
 
     p = sub.add_parser("audit-batch")
     p.add_argument("--batch")
