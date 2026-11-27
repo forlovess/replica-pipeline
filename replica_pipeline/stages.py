@@ -38,7 +38,8 @@ REQUIRED = {
     ],
     "4_stills": [
         "qa/STILL-PRODUCT-LOCK.md",
-        "qa/SIZE-LOCK.json",  # film-level product scale canon (usually S01 still)
+        "qa/SIZE-LOCK.json",  # film-level product scale (user_spec | first_frame)
+        "qa/PERSON-LOCK.json",  # same presenter across shots (source-level continuity)
     ],
     "5_h3": [
         # validated dynamically: every beat shot has shots/Sxx.mp4 + meaning pass note

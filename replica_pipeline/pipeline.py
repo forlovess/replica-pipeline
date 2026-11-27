@@ -228,7 +228,27 @@ def validate_stills(film: Path) -> list[str]:
         elif lock.is_file():
             errs.append(f"{sid}: not found in STILL-PRODUCT-LOCK.md")
     errs.extend(validate_size_lock(film, shots))
+    errs.extend(validate_person_lock(film, shots))
     return errs
+
+
+def validate_person_lock(film: Path, shots: list) -> list[str]:
+    """Same presenter across shots — match source continuity degree."""
+    p = film / "qa/PERSON-LOCK.json"
+    if not p.is_file():
+        return [
+            "qa/PERSON-LOCK.json required (same person/outfit across shots; "
+            "canon usually S01 still + presenter-place.md)"
+        ]
+    try:
+        data = json.loads(p.read_text())
+    except Exception as e:
+        return [f"PERSON-LOCK.json: {e}"]
+    try:
+        from .person_lock import validate_person_lock_data
+    except ImportError:
+        from person_lock import validate_person_lock_data
+    return validate_person_lock_data(data, film, shots)
 
 
 def validate_h3(film: Path) -> list[str]:
@@ -399,6 +419,13 @@ def cmd_require(args: argparse.Namespace) -> int:
         size_lock = film / "qa/SIZE-LOCK.json"
         if not size_lock.is_file():
             print("GATE FAIL: missing qa/SIZE-LOCK.json (film-level product size)", file=sys.stderr)
+            return 2
+        person_lock = film / "qa/PERSON-LOCK.json"
+        if not person_lock.is_file():
+            print(
+                "GATE FAIL: missing qa/PERSON-LOCK.json (film-level presenter continuity)",
+                file=sys.stderr,
+            )
             return 2
         # S02+ require S01 voice bank
         if shot != first_id:
