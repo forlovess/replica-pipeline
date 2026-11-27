@@ -5,14 +5,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-def _pipeline_py() -> Path:
-    here = Path(__file__).resolve().parent
-    return here / "pipeline.py"
+PIPELINE_PY = Path(__file__).resolve().parent / "pipeline.py"
 
 
 def require(film_dir: Path | str, action: str, shot: str | None = None) -> None:
     film_dir = Path(film_dir)
-    cmd = [sys.executable, str(_pipeline_py()), "require", str(film_dir), action]
+    cmd = [sys.executable, str(PIPELINE_PY), "require", str(film_dir), action]
     if shot:
         cmd.extend(["--shot", shot])
     r = subprocess.run(cmd, capture_output=True, text=True)

@@ -38,9 +38,11 @@ REQUIRED = {
     ],
     "4_stills": [
         "qa/STILL-PRODUCT-LOCK.md",
+        "qa/SIZE-LOCK.json",  # film-level product scale canon (usually S01 still)
     ],
     "5_h3": [
         # validated dynamically: every beat shot has shots/Sxx.mp4 + meaning pass note
+        # + VOICE-LOCK.json after S01 (S02+ must reuse that wav via ref2v)
     ],
     "6_assemble": [
         "qa/captioned.mp4",

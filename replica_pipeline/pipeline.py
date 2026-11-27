@@ -2,15 +2,14 @@
 """Fail-closed replica pipeline CLI.
 
 Usage:
-  python -m replica_pipeline.pipeline init [--batch DIR] [--film DIR]
-  python -m replica_pipeline.pipeline status FILM_DIR
-  python -m replica_pipeline.pipeline require FILM_DIR ACTION
-  python -m replica_pipeline.pipeline set FILM_DIR STAGE STATUS [--note TEXT]
-  python -m replica_pipeline.pipeline advance FILM_DIR
-  python -m replica_pipeline.pipeline gate-check FILM_DIR STAGE
-  python -m replica_pipeline.pipeline audit-batch [BATCH_DIR]
-  python -m replica_pipeline.pipeline void-sparse7 FILM_DIR
-  python -m replica_pipeline.pipeline allow-superres FILM_DIR
+  python pipeline.py init [--batch DIR] [--film DIR]
+  python pipeline.py status FILM_DIR
+  python pipeline.py require FILM_DIR ACTION   # h3_submit|assemble|superres
+  python pipeline.py set FILM_DIR STAGE STATUS [--note TEXT]
+  python pipeline.py advance FILM_DIR         # mark current stage pass if artifacts ok
+  python pipeline.py gate-check FILM_DIR STAGE
+  python pipeline.py audit-batch [BATCH_DIR]
+  python pipeline.py void-sparse7 FILM_DIR    # mark old 7-shot sparse work void
 
 Exit codes: 0 ok, 2 gate fail, 3 bad args.
 """
@@ -24,7 +23,7 @@ import time
 from pathlib import Path
 
 try:
-    from replica_pipeline.stages import (
+    from .stages import (
         ACTION_REQUIRES,
         REQUIRED,
         STAGE_ORDER,
@@ -135,6 +134,7 @@ def validate_beat_plan(plan_path: Path) -> list[str]:
     shots = plan.get("shots") or []
     if len(shots) < 1:
         errs.append("REBEAT-PLAN: empty shots")
+    # Ban fixed-7 template without cut/vo basis
     if len(shots) == 7 and plan.get("source_basis") in (None, "fixed7", "nov23_template"):
         errs.append("REBEAT-PLAN: 7 shots without source_basis (cuts/vo) — forbidden template")
     for s in shots:
@@ -148,6 +148,7 @@ def validate_beat_plan(plan_path: Path) -> list[str]:
             errs.append(f"{s.get('id')}: sec={sec_f} not in 4–15")
         if not s.get("source") and not plan.get("source_basis"):
             errs.append(f"{s.get('id')}: missing source basis")
+    # Prefer explicit basis field
     if not plan.get("source_basis") and not any(s.get("source") for s in shots):
         errs.append("REBEAT-PLAN: set source_basis=scene_merge|vo_beat")
     return errs
@@ -167,8 +168,10 @@ def validate_vo_density(film: Path) -> list[str]:
     if src <= 0:
         return errs
     ratio = rem / src if src else 0
-    if d.get("ratio") is None:
+    d_ratio = d.get("ratio")
+    if d_ratio is None:
         errs.append("vo-density.json: missing ratio")
+    # Soft gate: if facts not exhausted, remake should be >= 0.8 of source
     if not d.get("facts_exhausted") and ratio < 0.8:
         errs.append(
             f"vo-density: remake/source={ratio:.2f} < 0.80 and facts_exhausted!=true "
@@ -176,6 +179,39 @@ def validate_vo_density(film: Path) -> list[str]:
         )
     if d.get("looped_claims"):
         errs.append("vo-density: looped_claims=true forbidden")
+    return errs
+
+
+def validate_size_lock(film: Path, shots: list) -> list[str]:
+    """Film-level product scale must be locked; every still cites size PASS vs canon."""
+    errs = []
+    p = film / "qa/SIZE-LOCK.json"
+    if not p.is_file():
+        return ["qa/SIZE-LOCK.json required (film-level product scale canon)"]
+    try:
+        data = json.loads(p.read_text())
+    except Exception as e:
+        return [f"SIZE-LOCK.json: {e}"]
+    canon = data.get("canon_still") or data.get("canon")
+    if not canon:
+        errs.append("SIZE-LOCK.json: missing canon_still")
+    else:
+        canon_path = film / canon if not Path(canon).is_absolute() else Path(canon)
+        if not canon_path.is_file():
+            # also allow path relative to batch parent
+            alt = film.parent / canon
+            if not alt.is_file():
+                errs.append(f"SIZE-LOCK.json: canon_still missing on disk: {canon}")
+    if not data.get("phrase") and not data.get("worn_rule"):
+        errs.append("SIZE-LOCK.json: missing phrase or worn_rule (scale copy for prompts)")
+    shot_map = data.get("shots") or {}
+    for s in shots:
+        sid = s["id"]
+        st = shot_map.get(sid)
+        if isinstance(st, dict):
+            st = st.get("size") or st.get("status")
+        if str(st).upper() != "PASS":
+            errs.append(f"SIZE-LOCK.json: {sid} size not PASS")
     return errs
 
 
@@ -191,19 +227,24 @@ def validate_stills(film: Path) -> list[str]:
         sid = s["id"]
         still = film / "first-frames" / "h3" / f"{sid}-first.jpg"
         if not still.is_file():
+            # also accept first-frames/Sxx.jpg + note h3 missing
             alt = film / "first-frames" / f"{sid}.jpg"
             if not alt.is_file():
                 errs.append(f"missing still {sid}")
             else:
                 errs.append(f"missing h3 still first-frames/h3/{sid}-first.jpg")
+        # require PASS mention in lock file
         if lock_txt and sid in lock_txt:
+            # crude: look for S01 ... PASS nearby
             if not re.search(rf"{sid}[^\n]*PASS", lock_txt) and not re.search(
                 rf"\|\s*{sid}\s*\|[^\n]*PASS", lock_txt
             ):
+                # allow summary line "S01–S07 PASS" style
                 if not re.search(rf"{sid}.*PASS|PASS.*{sid}|全部.*PASS|S0\d–S0\d.*PASS", lock_txt):
                     errs.append(f"{sid}: not marked PASS in STILL-PRODUCT-LOCK.md")
         elif lock.is_file():
             errs.append(f"{sid}: not found in STILL-PRODUCT-LOCK.md")
+    errs.extend(validate_size_lock(film, shots))
     return errs
 
 
@@ -224,12 +265,38 @@ def validate_h3(film: Path) -> list[str]:
             errs.append(f"{sid}: meaning PASS missing in qa/H3-MEANING.md")
     if not meaning.is_file():
         errs.append("qa/H3-MEANING.md required")
+    # Film-level voice lock required once more than one shot exists and S01 is on disk
+    if len(shots) >= 2:
+        s01 = shots[0]["id"]
+        if (film / "shots" / f"{s01}.mp4").is_file():
+            vjson = film / "qa/VOICE-LOCK.json"
+            vwav = film / "qa/voice-lock/S01-voice.wav"
+            if not vwav.is_file():
+                errs.append("qa/voice-lock/S01-voice.wav required (extract from S01)")
+            if not vjson.is_file():
+                errs.append("qa/VOICE-LOCK.json required")
+            # later shots must have been submitted with voice ref recorded
+            for s in shots[1:]:
+                sid = s["id"]
+                task = film / "tasks" / f"{sid}.task.json"
+                if task.is_file():
+                    try:
+                        st = json.loads(task.read_text())
+                    except Exception:
+                        continue
+                    if st.get("state") == "DOWNLOADED" and not st.get("voice_ref"):
+                        errs.append(
+                            f"{sid}: DOWNLOADED without voice_ref — must ref2v+S01 voice"
+                        )
+                    if st.get("mode") == "i2v" and st.get("state") == "DOWNLOADED":
+                        errs.append(
+                            f"{sid}: mode=i2v after S01 — must use ref2v with voice lock"
+                        )
     return errs
 
 
 def refresh_locks(data: dict) -> None:
     stages = data["stages"]
-
     def passed(s: str) -> bool:
         return stages.get(s, {}).get("status") == "pass"
 
@@ -240,13 +307,14 @@ def refresh_locks(data: dict) -> None:
         and passed("4_stills")
     )
     data["locks"]["assemble"] = passed("5_h3")
+    # Open only with user allow + assemble pass; stage 7 pass means superres already done.
     data["locks"]["superres"] = passed("6_assemble") and bool(
         data["locks"].get("superres_user_allow")
     )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    batch = Path(args.batch) if args.batch else Path.cwd()
+    batch = Path(args.batch) if args.batch else Path(__file__).resolve().parent.parent
     films = [Path(args.film)] if args.film else discover_films(batch)
     for film in films:
         if not film.is_dir():
@@ -257,6 +325,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             print("exists", p)
             continue
         data = blank_state(film.name)
+        # If REBEAT already written, note it but do not auto-pass
         if (film / "qa/REBEAT-PLAN.json").is_file():
             data["stages"]["3_beat_plan"]["note"] = "REBEAT-PLAN.json present — run advance after source/vo pass"
         save(film, data)
@@ -286,6 +355,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_require(args: argparse.Namespace) -> int:
+    """Hard gate for scripts. Exit 2 if locked."""
     film = Path(args.film)
     action = args.action
     if action not in ACTION_REQUIRES:
@@ -295,7 +365,12 @@ def cmd_require(args: argparse.Namespace) -> int:
     refresh_locks(data)
     save(film, data)
 
+    if data.get("void", {}).get("sparse7_template") and action == "h3_submit":
+        # Allow H3 only after rebeat stages passed; void flag is informational once rebeat done
+        pass
+
     need = ACTION_REQUIRES[action]
+    # all stages up to and including need must pass
     for s in STAGE_ORDER:
         if data["stages"][s]["status"] != "pass":
             print(
@@ -321,6 +396,7 @@ def cmd_require(args: argparse.Namespace) -> int:
             print("GATE FAIL: assemble not pass", file=sys.stderr)
             return 2
 
+    # Per-shot still for h3_submit
     if action == "h3_submit" and args.shot:
         shot = args.shot
         still = film / "first-frames" / "h3" / f"{shot}-first.jpg"
@@ -328,10 +404,27 @@ def cmd_require(args: argparse.Namespace) -> int:
             print(f"GATE FAIL: missing {still}", file=sys.stderr)
             return 2
         plan = film / "qa/REBEAT-PLAN.json"
+        first_id = "S01"
         if plan.is_file():
-            ids = {s["id"] for s in json.loads(plan.read_text()).get("shots") or []}
+            shots = json.loads(plan.read_text()).get("shots") or []
+            ids = {s["id"] for s in shots}
             if shot not in ids:
                 print(f"GATE FAIL: {shot} not in REBEAT-PLAN.json", file=sys.stderr)
+                return 2
+            if shots:
+                first_id = shots[0]["id"]
+        size_lock = film / "qa/SIZE-LOCK.json"
+        if not size_lock.is_file():
+            print("GATE FAIL: missing qa/SIZE-LOCK.json (film-level product size)", file=sys.stderr)
+            return 2
+        # S02+ require S01 voice bank
+        if shot != first_id:
+            vwav = film / "qa/voice-lock/S01-voice.wav"
+            if not vwav.is_file():
+                print(
+                    f"GATE FAIL: missing {vwav} — run extract-voice after {first_id} downloads",
+                    file=sys.stderr,
+                )
                 return 2
 
     print(json.dumps({"ok": True, "action": action, "film": film.name}, ensure_ascii=False))
@@ -354,6 +447,7 @@ def cmd_set(args: argparse.Namespace) -> int:
         if not ok:
             print("cannot PASS; missing:", ", ".join(missing), file=sys.stderr)
             return 2
+        # prior stages must pass
         for s in STAGE_ORDER:
             if s == stage:
                 break
@@ -365,6 +459,7 @@ def cmd_set(args: argparse.Namespace) -> int:
         "note": args.note or data["stages"][stage].get("note", ""),
         "updated": now(),
     }
+    # bump current
     if status == "pass":
         idx = STAGE_ORDER.index(stage)
         if idx + 1 < len(STAGE_ORDER):
@@ -409,12 +504,14 @@ def cmd_void_sparse7(args: argparse.Namespace) -> int:
         "note": args.note or "Old 7-shot sparse VO/cut plan void — must rebeat via pipeline",
         "at": now(),
     }
+    # Reset pipeline stages so nothing is falsely pass
     for s in STAGE_ORDER:
         data["stages"][s] = {"status": "pending", "note": "reset after void-sparse7", "updated": now()}
     data["current"] = STAGE_ORDER[0]
     data["locks"]["superres_user_allow"] = False
     refresh_locks(data)
     save(film, data)
+    # stamp a marker file
     marker = film / "qa/VOID-SPARSE7.md"
     marker.write_text(
         f"# VOID sparse7\n\n{data['void']['note']}\n\nat: {data['void']['at']}\n"
@@ -436,8 +533,20 @@ def cmd_allow_superres(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_extract_voice(args: argparse.Namespace) -> int:
+    try:
+        from .voice_lock import ensure_voice_lock
+    except ImportError:
+        from voice_lock import ensure_voice_lock
+
+    film = Path(args.film)
+    meta = ensure_voice_lock(film, force=bool(args.force))
+    print(json.dumps({"ok": True, **meta}, ensure_ascii=False))
+    return 0
+
+
 def cmd_audit_batch(args: argparse.Namespace) -> int:
-    batch = Path(args.batch) if args.batch else Path.cwd()
+    batch = Path(args.batch) if args.batch else Path(__file__).resolve().parent.parent
     rows = []
     for film in discover_films(batch):
         p = film_pipeline(film)
@@ -499,6 +608,11 @@ def main() -> int:
     p = sub.add_parser("allow-superres")
     p.add_argument("film")
     p.set_defaults(func=cmd_allow_superres)
+
+    p = sub.add_parser("extract-voice")
+    p.add_argument("film")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_extract_voice)
 
     p = sub.add_parser("audit-batch")
     p.add_argument("--batch")
