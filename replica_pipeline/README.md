@@ -27,17 +27,25 @@ python3 $PL audit-batch
 3. `3_beat_plan` — `qa/REBEAT-PLAN.json`（每镜 4–15s；禁止无依据的固定 7 镜模板）
 4. `4_stills` — 每镜静帧 + `STILL-PRODUCT-LOCK.md` + **`SIZE-LOCK.json`** + **`PERSON-LOCK.json`（人物连续）**
 5. `5_h3` — 每镜 `shots/Sxx.mp4` + `qa/H3-MEANING.md` PASS + **S01 后音色锁**
-6. `6_assemble` — captioned + bgm + `assemble-check.json`
+6. `6_assemble` — captioned + BGM（**优先源配乐**；不行再新曲）+ `assemble-check.json`（写明 `bgm_source: source|new`）
 7. `7_superres` — 须 `allow-superres`（用户确认）
+
+### BGM 规则
+
+- **能抽就用源片配乐**（音乐床 / 可分离的 BGM），压在复刻人声下面；口播仍用 H3 生成声，不用源口播顶替。
+- 源无乐、抽不干净、工具/版权不可用 → 再选合景新曲；新曲不要批内一条曲打天下。
+- `assemble-check.json` 建议字段：`bgm_source`（`source`|`new`）、`bgm_path`、`bg_volume`。
 
 ## 全片硬锁（新增）
 
-### 0) 人物一致性（跟本条复刻人物，禁止自由发挥）
+### 0) 静帧主路径 + 人物一致（禁止自由发挥）
 
-- **开局**：按 `presenter-place.md` 对齐源片的性别/年龄段/发型/服装/场所（不要另造人设）。
-- **定妆后**：以本条复刻过审人物静帧（通常 S01）为 `PERSON-LOCK.canon_still`；S02+ **必须跟这个复刻人物一致**，不能每镜自由换脸/换装。
-- 程度：跟复刻已定人物连续即可；**不是**像素贴源片脸，也**不是**每镜重新发挥。
-- 画 S02+ 静帧时把 **PERSON canon 静帧** 和商品图一起当 reference。
+**主路径：** Hypit 切源片 → 提每镜首帧 → AI **只换商品**（锁样式 + 大小）→ `first-frames/h3/Sxx-first.jpg`。  
+人物/场所/姿势跟原镜首帧走，自然连续；有原镜首帧时不要整图另造场景。
+
+- **开局**：按 `presenter-place.md`；换品后的 S01 定为 `PERSON-LOCK.canon_still`。
+- **定妆后**：S02+ 跟该复刻人物一致（通常就是各镜源首帧换品结果），不能自由换脸/换装。
+- 程度：跟复刻已定人物连续；不是像素换脸 ID。
 
 ```json
 {

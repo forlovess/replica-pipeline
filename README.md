@@ -21,6 +21,9 @@ Hypit cut source → extract each shot t0 → AI **product-replace** on that fra
 | `user_spec` | User stated size | That spec globally |
 | `first_frame` | No size stated | S01 still globally |
 
+### BGM
+Prefer source soundtrack under remake voice when extractable; else new track. Remake spoken track stays generated (not source 口播).
+
 ## CLI
 
 ```bash
