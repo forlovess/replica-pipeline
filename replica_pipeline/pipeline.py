@@ -183,8 +183,7 @@ def validate_vo_density(film: Path) -> list[str]:
 
 
 def validate_size_lock(film: Path, shots: list) -> list[str]:
-    """Film-level product scale must be locked; every still cites size PASS vs canon."""
-    errs = []
+    """Film-level product scale: user_spec wins; else first_frame (S01) is canon."""
     p = film / "qa/SIZE-LOCK.json"
     if not p.is_file():
         return ["qa/SIZE-LOCK.json required (film-level product scale canon)"]
@@ -192,27 +191,11 @@ def validate_size_lock(film: Path, shots: list) -> list[str]:
         data = json.loads(p.read_text())
     except Exception as e:
         return [f"SIZE-LOCK.json: {e}"]
-    canon = data.get("canon_still") or data.get("canon")
-    if not canon:
-        errs.append("SIZE-LOCK.json: missing canon_still")
-    else:
-        canon_path = film / canon if not Path(canon).is_absolute() else Path(canon)
-        if not canon_path.is_file():
-            # also allow path relative to batch parent
-            alt = film.parent / canon
-            if not alt.is_file():
-                errs.append(f"SIZE-LOCK.json: canon_still missing on disk: {canon}")
-    if not data.get("phrase") and not data.get("worn_rule"):
-        errs.append("SIZE-LOCK.json: missing phrase or worn_rule (scale copy for prompts)")
-    shot_map = data.get("shots") or {}
-    for s in shots:
-        sid = s["id"]
-        st = shot_map.get(sid)
-        if isinstance(st, dict):
-            st = st.get("size") or st.get("status")
-        if str(st).upper() != "PASS":
-            errs.append(f"SIZE-LOCK.json: {sid} size not PASS")
-    return errs
+    try:
+        from .size_lock import validate_size_lock_data
+    except ImportError:
+        from size_lock import validate_size_lock_data
+    return validate_size_lock_data(data, film, shots)
 
 
 def validate_stills(film: Path) -> list[str]:
