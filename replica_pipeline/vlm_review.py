@@ -213,21 +213,32 @@ def review_still_with_vlm(
     )
     cm = size_ctx.get("physical_cm") or {}
     cm_str = f"{cm.get('w')}x{cm.get('h')}x{cm.get('d')}cm" if cm else size_ctx.get("phrase", "mini backpack")
-    worn_rule = size_ctx.get("worn_rule") or "bag width ~1/3-2/5 of torso/chest, not travel-bag scale"
+    worn_rule = size_ctx.get("worn_rule") or (
+        "worn: bag width ~2/3 of back width (match worn_scale_ref); "
+        "handheld/table: forearm-length ~physical height; NOT travel-bag; NOT charm"
+    )
     traits = _load_person_traits(film)
+    phrase = size_ctx.get("phrase") or ""
 
     prompt = (
         "You are an independent strict visual QA reviewer (NOT the image generator).\n"
         f"Reference images:\n{ref_desc or '- (none)'}\n"
         f"- Image {target_idx}: CANDIDATE STILL for shot {shot} ({still.name}).\n\n"
-        f"Target product spec: {cm_str}; {worn_rule}.\n"
+        f"Target product spec: {cm_str}.\n"
+        f"SIZE AUTHORITY (override any older 1/3–2/5 or ~1/2-back heuristics): {worn_rule}\n"
+        + (f"Size phrase: {phrase}\n" if phrase else "")
+        + "When worn_scale_ref / size_diagram / canon_still are provided, judge scale against those images "
+        "and the SIZE AUTHORITY text — do NOT invent a smaller 'cute mini' target.\n"
         + (f"Locked presenter traits: {traits}\n" if traits else "")
         + f"\nEvaluate ONLY Image {target_idx} strictly:\n"
-        "1. size_match: Does the product match the real mini scale (~1.1-1.3x adult head height when held, "
-        "~1/2 torso/back width when worn, hands larger than pockets)? Mark false if oversized like a 35-40cm "
-        "school/travel backpack OR shrunk like a 15cm toy pouch.\n"
+        "1. size_match: Product matches SIZE AUTHORITY + ref images for this framing "
+        "(worn ≈ ~2/3 back width if that is the lock; handheld ≈ forearm / physical_cm). "
+        "Mark false only for clear travel-bag (~35–40cm+) OR charm/toy (~15cm) extremes, "
+        "or clear mismatch vs worn_scale_ref/canon_still. Close-up framing that fills the frame is OK "
+        "if hand/body scale still matches physical_cm.\n"
         "2. identity_match: All product design details match reference (pattern, applique, ears/pearls, bow, lace, no wrong color bow).\n"
-        "3. person_match: Presenter matches canon_still / locked traits (if a person is visible; true for product-only close-ups).\n"
+        "3. person_match: Presenter matches canon_still / locked traits (if a person is visible; true for product-only close-ups). "
+        "Sleeve length on a hand-only crop is not a fail if skin/jewelry/outfit color match canon.\n"
         "4. no_extra_tags: No hallucinated SKU stickers, watermarks, or baked text overlays.\n"
         "Return strict JSON. verdict='PASS' ONLY if all four booleans are true."
     )
@@ -290,15 +301,20 @@ def review_video_with_vlm(
     )
     cm = size_ctx.get("physical_cm") or {}
     cm_str = f"{cm.get('w')}x{cm.get('h')}x{cm.get('d')}cm" if cm else size_ctx.get("phrase", "mini backpack")
+    worn_rule = size_ctx.get("worn_rule") or (
+        "worn: bag width ~2/3 of back width (match worn_scale_ref); "
+        "handheld/table: forearm-length ~physical height; NOT travel-bag; NOT charm"
+    )
 
     prompt = (
         "You are an independent strict video QA reviewer.\n"
         f"Reference images:\n{ref_desc or '- (none)'}\n"
         f"- Image {target_idx}: 4-FRAME HORIZONTAL CONTACT SHEET (10%, 35%, 65%, 90%) from generated video {shot}.\n\n"
         f"Target product spec: {cm_str}.\n"
+        f"SIZE AUTHORITY (override older 1/3–2/5 or ~1/2-back heuristics): {worn_rule}\n"
         f"Inspect all 4 frames in Image {target_idx} strictly:\n"
         "1. size_stable: Product size stays consistent across all 4 frames (false if it shrinks/bloats mid-clip).\n"
-        "2. size_vs_spec: 'match' if scale matches spec across frames, else 'too_big', 'too_small', or 'drift'.\n"
+        "2. size_vs_spec: 'match' if scale matches SIZE AUTHORITY + refs across frames, else 'too_big', 'too_small', or 'drift'.\n"
         "3. identity_intact: Product colors/applique/ears/bow/lace stay intact across all 4 frames.\n"
         "4. no_baked_captions: No AI-generated Chinese/English subtitle text burned into the video frames.\n"
         "5. no_hallucinated_tags: No invented SKU stickers or tags on the product.\n"
