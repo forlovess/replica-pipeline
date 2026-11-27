@@ -2,7 +2,8 @@
 
 Fail-closed `/replica` 生产闸门：缺产物不能进下一步；H3 / 拼装 / 超分全部硬拦截。
 
-**仓库：** https://github.com/forlovess/replica-pipeline
+**仓库：** https://github.com/forlovess/replica-pipeline  
+**本机目录：** `/Volumes/greatwall/code/replica-pipeline`
 
 ## 七步
 
